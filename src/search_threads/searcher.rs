@@ -7,12 +7,10 @@ use crate::search_threads::{SearchResult, evaluation, print_info};
 use minstant::Instant;
 use rand::seq::SliceRandom;
 use std::cmp::{Reverse, max};
-use std::io::Write;
-use std::io::stdout;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const MAX_DEPTH: u8 = 16;
+const MAX_DEPTH: u8 = 32;
 
 pub struct Search {
     pub(crate) nodes_searched: u64,
@@ -62,14 +60,14 @@ impl Search {
         if let Some(result) = transposition_table_result {
             tt_move = Some(result.best_move);
         }
-        let mut legal_moves = self.sort_moves(board, &legal_moves, tt_move, None, color);
+        let mut sorted_moves = self.sort_moves(board, &legal_moves, tt_move, None, color);
         if search_id > 0 {
-            legal_moves.shuffle(&mut rand::rng());
+            sorted_moves[1..].shuffle(&mut rand::rng());
         }
-        let legal_moves = legal_moves;
+        let mut sorted_moves: Vec<(Move, i32)> = sorted_moves.iter().map(|&m| (m, 0)).collect();
 
         let mut best_score = -i32::MAX;
-        let mut best_move = &legal_moves[0];
+        let mut best_move = sorted_moves[0].0;
         let mut best_depth = 0;
         let mut best_ply = 0;
         let timer = Instant::now();
@@ -81,34 +79,81 @@ impl Search {
                 && elapsed < 10000
         };
         'iterative_deepening: for depth in 0..MAX_DEPTH {
+            if depth > 0 {
+                sorted_moves.sort_by_key(|&(_, eval)| Reverse(eval));
+            }
+
             let mut depth_best_score = -i32::MAX;
             let mut depth_best_move = best_move;
             let mut depth_best_ply = 0;
-            for mov in &legal_moves {
+            for i in 0..sorted_moves.len() {
+                let (mov, sort_eval) = &mut sorted_moves[i];
                 let metadata = board.make_move(mov);
 
-                let result = self.negamax(
-                    board,
-                    transposition_table,
-                    depth,
-                    0,
-                    -i32::MAX,
-                    -depth_best_score,
-                    -color,
-                    &time_ok,
-                    nodes_searched,
-                );
+                let result = if i == 0 || depth < 2 {
+                    self.negamax(
+                        board,
+                        transposition_table,
+                        depth,
+                        0,
+                        -i32::MAX,
+                        -depth_best_score,
+                        -color,
+                        &time_ok,
+                        nodes_searched,
+                    )
+                } else {
+                    // Moves that aren't the first one probably aren't as good, so do a null window search
+                    // to confirm that they're not better than the best move
+                    let pvs = self.negamax(
+                        board,
+                        transposition_table,
+                        depth,
+                        0,
+                        -depth_best_score - 1,
+                        -depth_best_score,
+                        -color,
+                        &time_ok,
+                        nodes_searched,
+                    );
+                    if let Some(pvs) = pvs {
+                        // If the move's not worth looking at, just return that search result
+                        let value = -pvs.0;
+                        if value <= depth_best_score {
+                            Some(pvs)
+                        } else {
+                            // If it turns out it is actually better, we need a full search to quantify how much better
+                            self.negamax(
+                                board,
+                                transposition_table,
+                                depth,
+                                0,
+                                -i32::MAX,
+                                -depth_best_score,
+                                -color,
+                                &time_ok,
+                                nodes_searched,
+                            )
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 if result.is_none() {
+                    board.unmake_move(mov, metadata);
                     break 'iterative_deepening;
                 }
 
                 let (eval, searched_ply) = result.unwrap();
-
                 let eval = -eval;
+
+                *sort_eval = eval;
+
                 board.unmake_move(mov, metadata);
                 if eval > depth_best_score {
                     depth_best_score = eval;
-                    depth_best_move = mov;
+                    depth_best_move = *mov;
                     depth_best_ply = searched_ply;
                 }
 
@@ -131,6 +176,11 @@ impl Search {
             best_move = depth_best_move;
             best_depth = depth;
             best_ply = depth_best_ply;
+            // We've reached the maximum depth, any further search is meaningless so exit early
+            if depth + 1 == MAX_DEPTH {
+                stop_signal.store(true, Ordering::Relaxed);
+                break 'iterative_deepening;
+            }
         }
 
         nodes_searched.fetch_add(self.nodes_searched % 2047, Ordering::Relaxed);
@@ -138,7 +188,7 @@ impl Search {
             depth: best_depth,
             best_ply,
             score: best_score,
-            best_move: *best_move,
+            best_move,
         }
     }
 
@@ -240,35 +290,10 @@ impl Search {
             }
             let mov = sorted_moves[i];
 
-            let mut move_extensions = extensions;
-            let mut late_move_reduction = false;
-            if depth > 2 && sorted_moves.len() > 4 && i > 2 {
-                move_extensions -= 1; // Late move reduction
-                late_move_reduction = true;
-            }
-
             let metadata = board.make_move(&mov);
-            let result = self.negamax(
-                board,
-                transposition_table,
-                max(0, depth as i8 + move_extensions) as u8,
-                search_ply + 1,
-                -beta,
-                -alpha,
-                -color,
-                time_ok,
-                nodes_searched,
-            );
 
-            result?;
-
-            let (value, mut searched_ply) = result.unwrap();
-
-            let mut value = -value;
-            // If our reduced depth search turns out to be worth looking at and not immediately cut off,
-            if late_move_reduction && alpha < value && value < beta {
-                // Need to do a full research at the depth without reductions
-                let result = self.negamax(
+            let search = if i == 0 || depth < 2 {
+                self.negamax(
                     board,
                     transposition_table,
                     max(0, depth as i8 + extensions) as u8,
@@ -278,13 +303,59 @@ impl Search {
                     -color,
                     time_ok,
                     nodes_searched,
+                )
+            } else {
+                let mut move_extensions = extensions;
+                if depth > 2 && sorted_moves.len() > 4 && i > 2 {
+                    move_extensions -= 1;
+                }
+                // Moves that aren't first probably aren't worth looking at, so do a null-window
+                // search with reduced depth to confirm that's the case
+                let pvs_reduced_depth = self.negamax(
+                    board,
+                    transposition_table,
+                    max(0, depth as i8 + move_extensions) as u8,
+                    search_ply + 1,
+                    -alpha - 1,
+                    -alpha,
+                    -color,
+                    time_ok,
+                    nodes_searched,
                 );
-                result?;
+                if let Some(pvs_reduced_depth) = pvs_reduced_depth {
+                    // If the move is not worth looking at, just return that search result
+                    let value = -pvs_reduced_depth.0;
+                    if value <= alpha {
+                        Some(pvs_reduced_depth)
+                    } else {
+                        // If it turns out it is worth looking at,
+                        // research with full depth and full window
+                        self.negamax(
+                            board,
+                            transposition_table,
+                            max(0, depth as i8 + extensions) as u8,
+                            search_ply + 1,
+                            -beta,
+                            -alpha,
+                            -color,
+                            time_ok,
+                            nodes_searched,
+                        )
+                    }
+                } else {
+                    None
+                }
+            };
 
-                let (researched_value, researched_ply) = result.unwrap();
-                value = -researched_value;
-                searched_ply = researched_ply;
+            if search.is_none() {
+                board.unmake_move(&mov, metadata);
+                return None;
             }
+
+            let (value, searched_ply) = search.unwrap();
+
+            let value = -value;
+
             board.unmake_move(&mov, metadata);
             if value > best_value {
                 best_value = value;
@@ -302,9 +373,10 @@ impl Search {
             }
         }
 
+        let tt_score = if evaluation_type == -1 { beta } else { alpha };
         transposition_table.insert(
             board.zobrist_hash,
-            EntryResult::new(depth, best_value, evaluation_type, best_move),
+            EntryResult::new(depth, tt_score, evaluation_type, best_move),
         );
         Some((best_value, best_searched_ply))
     }
@@ -363,6 +435,7 @@ impl Search {
             if !time_ok() {
                 return None;
             }
+
             let see = evaluation::static_exchange_evaluation(board, &mov);
             if see < 0 {
                 continue;
@@ -379,13 +452,12 @@ impl Search {
                 time_ok,
                 nodes_searched,
             );
-
+            board.unmake_move(&mov, metadata);
             result?;
 
             let (eval, searched_ply) = result.unwrap();
-
             let eval = -eval;
-            board.unmake_move(&mov, metadata);
+
             if eval > best_value {
                 best_value = eval;
                 best_search_ply = searched_ply;
