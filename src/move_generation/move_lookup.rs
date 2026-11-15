@@ -1,4 +1,22 @@
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::_pext_u64;
+
+/// Portable PEXT for targets without BMI2 (e.g. Apple Silicon).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn _pext_u64(src: u64, mut mask: u64) -> u64 {
+    let mut out = 0u64;
+    let mut bit = 1u64;
+    while mask != 0 {
+        let low = mask & mask.wrapping_neg();
+        if src & low != 0 {
+            out |= bit;
+        }
+        mask ^= low;
+        bit <<= 1;
+    }
+    out
+}
 use std::sync::LazyLock;
 
 fn get_mask_subsets(blocker: u64) -> Vec<u64> {

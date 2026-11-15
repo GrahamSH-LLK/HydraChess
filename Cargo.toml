@@ -1,8 +1,8 @@
-[build]
-rustflags = ["-C", "target_cpu=native", "link-arg=-fuse-ld=mold", "-Clink-arg=-Wl,--no-rosegment"]
-
 [profile.release]
 #debug = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 
 [package]
 name = "HydraChess"
@@ -10,5 +10,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rand = "0.10.3"
 minstant = "0.1.7"

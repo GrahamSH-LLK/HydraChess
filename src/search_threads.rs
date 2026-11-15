@@ -1,237 +1,258 @@
+mod eval_params;
 mod evaluation;
 mod searcher;
 mod transposition_table;
+mod tune;
+
+pub use tune::tune;
 
 use super::move_generation;
 use super::move_generation::Board;
 use crate::move_generation::mov::Move;
-use crate::search_threads::searcher::Search;
+pub use crate::search_threads::searcher::Limits;
+use crate::search_threads::searcher::{Search, SearchContext};
 use crate::search_threads::transposition_table::TranspositionTable;
 use minstant::Instant;
 use std::io::Write;
 use std::io::stdout;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::thread::sleep;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-struct SearchResult {
-    depth: u8,
-    best_ply: u8,
-    score: i32,
-    best_move: Move,
-    // pv: Vec<Move>, // TODO
+pub struct SearchResult {
+    pub depth: u8,
+    pub score: i32,
+    pub best_move: Move,
 }
 
 struct SharedState {
-    time_left: AtomicU64,
-    increment: AtomicU64,
+    limits: Mutex<Limits>,
     start_barrier: Barrier,
     end_barrier: Barrier,
     root_board: Mutex<Board>,
-    // Transposition table is lock-free to allow TT improvements in one thread to improve search_threads in another
+    // Transposition table is lock-free to allow TT improvements in one thread to improve searches in another
     transposition_table: TranspositionTable,
-    results: Vec<Mutex<SearchResult>>,
+    /// The main thread's result, which decides the move
+    result: Mutex<SearchResult>,
     nodes_searched: AtomicU64,
-}
-
-pub struct Signals {
-    pub stop_signal: Arc<AtomicBool>,
-    pub quit_signal: Arc<AtomicBool>,
+    /// Set by the GUI's `stop`
+    stop_signal: Arc<AtomicBool>,
+    /// Set by the main thread when it finishes, to stop the helper threads
+    abort_signal: AtomicBool,
+    /// Set when the worker threads should exit
+    shutdown: AtomicBool,
+    new_game: AtomicBool,
 }
 
 pub struct SearchThreads {
     shared_state: Arc<SharedState>,
-    moves_played: u32,
+    workers: Vec<JoinHandle<()>>,
 }
 
-// TODO: Don't hardcode
-const SEARCH_THREADS: usize = 4;
+pub const DEFAULT_THREADS: usize = 4;
+pub const DEFAULT_HASH_MB: usize = 64;
 
 impl SearchThreads {
-    pub fn new(signals: Signals) -> Self {
+    pub fn new(stop_signal: Arc<AtomicBool>, threads: usize, hash_mb: usize) -> Self {
         // Warm up the LazyLock'd lookups
         move_generation::move_lookup::initialize();
 
+        let threads = threads.max(1);
         // Coordinator thread is +1
-        let total_threads = SEARCH_THREADS + 1;
-
-        let mut results = Vec::with_capacity(SEARCH_THREADS);
-        for _ in 0..SEARCH_THREADS {
-            results.push(Mutex::new(SearchResult {
-                depth: 0,
-                best_ply: 0,
-                score: 0,
-                best_move: Move::null(),
-            }));
-        }
+        let total_threads = threads + 1;
 
         let shared_state = Arc::new(SharedState {
-            time_left: AtomicU64::new(0),
-            increment: AtomicU64::new(0),
+            limits: Mutex::new(Limits::default()),
             start_barrier: Barrier::new(total_threads),
             end_barrier: Barrier::new(total_threads),
             root_board: Mutex::new(Board::starting()),
-            transposition_table: TranspositionTable::new(64),
-            results,
+            transposition_table: TranspositionTable::new(hash_mb.max(1)),
+            result: Mutex::new(SearchResult {
+                depth: 0,
+                score: 0,
+                best_move: Move::null(),
+            }),
             nodes_searched: AtomicU64::new(0),
+            stop_signal,
+            abort_signal: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            new_game: AtomicBool::new(false),
         });
 
-        for i in 0..SEARCH_THREADS {
-            let state = Arc::clone(&shared_state);
-            let stop_signal = Arc::clone(&signals.stop_signal);
-            let quit_signal = Arc::clone(&signals.quit_signal);
-            thread::spawn(move || {
-                let mut search = Search::new();
-                loop {
-                    state.start_barrier.wait();
-                    sleep(Duration::from_millis((i as u64) * 2));
-                    if quit_signal.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let mut board = state.root_board.lock().unwrap().clone();
+        let workers = (0..threads)
+            .map(|id| {
+                let state = Arc::clone(&shared_state);
+                thread::spawn(move || {
+                    let mut search = Search::new(id);
+                    loop {
+                        state.start_barrier.wait();
+                        if state.shutdown.load(Relaxed) {
+                            break;
+                        }
+                        if state.new_game.load(Relaxed) {
+                            search.new_game();
+                        }
+                        let mut board = state.root_board.lock().unwrap().clone();
+                        let limits = *state.limits.lock().unwrap();
+                        let context = SearchContext {
+                            transposition_table: &state.transposition_table,
+                            stop_signal: &state.stop_signal,
+                            abort_signal: &state.abort_signal,
+                            nodes_searched: &state.nodes_searched,
+                        };
 
-                    let result = search.search(
-                        &mut board,
-                        &state.transposition_table,
-                        &stop_signal,
-                        state.time_left.load(Relaxed),
-                        state.increment.load(Relaxed),
-                        &state.nodes_searched,
-                        i,
-                    );
-
-                    *state.results[i].lock().unwrap() = result;
-                    if quit_signal.load(Ordering::Acquire) {
-                        break;
+                        let result = search.search(&mut board, &context, &limits);
+                        if id == 0 {
+                            *state.result.lock().unwrap() = result;
+                            // The main thread is done, so the helpers should stop too
+                            state.abort_signal.store(true, Relaxed);
+                        }
+                        // Always reach the end barrier, or the coordinator waits forever
+                        state.end_barrier.wait();
                     }
-                    state.end_barrier.wait();
-                }
-            });
-        }
+                })
+            })
+            .collect();
 
         Self {
             shared_state,
-            moves_played: 0,
+            workers,
         }
     }
 
     pub fn new_game(&mut self) {
         *self.shared_state.root_board.lock().unwrap() = Board::starting();
         self.shared_state.transposition_table.clear();
-        self.moves_played = 0;
+        self.shared_state.new_game.store(true, Relaxed);
     }
 
     pub fn position(&mut self, string: &str) {
         let parts: Vec<&str> = string.split_whitespace().collect();
+        let moves_index = parts.iter().position(|&p| p == "moves");
+        let position_end = moves_index.unwrap_or(parts.len());
 
-        if parts[0] == "startpos" {
-            *self.shared_state.root_board.lock().unwrap() = Board::starting();
-            self.moves_played = 0;
-            if parts.len() > 1 && parts[1] == "moves" {
-                self.position_moves(&parts[2..]);
+        let board = match parts.first() {
+            Some(&"startpos") => Board::starting(),
+            Some(&"fen") if position_end > 1 => {
+                let mut fen = parts[1..position_end].to_vec();
+                // Fill in missing halfmove and fullmove counters (e.g. EPD-style FENs)
+                while fen.len() < 6 {
+                    fen.push(if fen.len() == 4 { "0" } else { "1" });
+                }
+                Board::from_fen(&fen.join(" "))
             }
-        } else if parts[0] == "fen" {
-            *self.shared_state.root_board.lock().unwrap() = Board::from_fen(&parts[1..7].join(" "));
-            self.moves_played = 0;
-            if parts.len() > 7 && parts[7] == "moves" {
-                self.position_moves(&parts[8..]);
+            _ => return,
+        };
+        let mut board_guard = self.shared_state.root_board.lock().unwrap();
+        *board_guard = board;
+        if let Some(index) = moves_index {
+            for mov in &parts[index + 1..] {
+                board_guard.move_from_uci_lan(mov);
             }
-        }
-    }
-
-    fn position_moves(&mut self, moves: &[&str]) {
-        let mut board = self.shared_state.root_board.lock().unwrap();
-        for mov in moves {
-            board.move_from_uci_lan(mov);
-            self.moves_played += 1;
         }
     }
 
     pub fn debug(&self) {
         println!("Board: {}", self.shared_state.root_board.lock().unwrap());
-        println!("Moves played: {}", self.moves_played);
     }
 
-    pub fn go(
-        &mut self,
-        white_time_left_ms: u64,
-        white_increment: u64,
-        black_time_left_ms: u64,
-        black_increment: u64,
-    ) {
-        let (time_left_ms, increment) =
-            if self.shared_state.root_board.lock().unwrap().white_to_move() {
-                (white_time_left_ms, white_increment)
-            } else {
-                (black_time_left_ms, black_increment)
-            };
-        self.shared_state.nodes_searched.store(0, Relaxed);
-        self.shared_state.time_left.store(time_left_ms, Relaxed);
-        self.shared_state.increment.store(increment, Relaxed);
-        let time = Instant::now();
-        self.shared_state.start_barrier.wait();
-        self.shared_state.end_barrier.wait();
+    pub fn go(&mut self, mut limits: Limits) {
+        let state = &self.shared_state;
+        if state.root_board.lock().unwrap().white_to_move() {
+            limits.time_left_ms = limits.white_time_ms;
+            limits.increment_ms = limits.white_increment_ms;
+        } else {
+            limits.time_left_ms = limits.black_time_ms;
+            limits.increment_ms = limits.black_increment_ms;
+        }
+        *state.limits.lock().unwrap() = limits;
+        state.nodes_searched.store(0, Relaxed);
+        state.abort_signal.store(false, Relaxed);
+        state.transposition_table.new_search();
+        state.start_barrier.wait();
+        state.end_barrier.wait();
+        state.new_game.store(false, Relaxed);
 
-        let best_result = self
-            .shared_state
-            .results
-            .iter()
-            .map(|m| m.lock().unwrap())
-            .max_by_key(|r| (r.depth, r.score))
-            .unwrap();
-        print_info(
-            best_result.depth,
-            best_result.best_ply,
-            best_result.score,
-            time.elapsed().as_secs_f64(),
-            self.shared_state.nodes_searched.load(Relaxed),
-        );
+        // In infinite mode the best move may only be sent after the GUI says stop
+        if limits.infinite {
+            while !state.stop_signal.load(Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let best_move = state.result.lock().unwrap().best_move;
         let mut out = stdout().lock();
-        writeln!(out, "bestmove {}", best_result.best_move).unwrap();
+        if best_move == Move::null() {
+            // No legal moves (checkmate or stalemate)
+            writeln!(out, "bestmove 0000").unwrap();
+        } else {
+            writeln!(out, "bestmove {}", best_move).unwrap();
+        }
         out.flush().unwrap();
-        self.shared_state
-            .root_board
-            .lock()
-            .unwrap()
-            .make_move(&best_result.best_move);
+    }
+
+    /// Searches a fixed set of positions to a fixed depth on one thread and reports the total
+    /// node count, which is deterministic and useful as a search signature.
+    pub fn bench(depth: u8) {
+        const POSITIONS: [&str; 12] = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1pn1P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R b KQkq - 0 5",
+            "rnbqkb1r/ppp2ppp/4pn2/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w KQkq - 2 4",
+            "r2q1rk1/pp2bppp/2n1bn2/2pp4/3P4/2PBPN2/PP1N1PPP/R2QK2R w KQ - 0 9",
+            "8/5pk1/6p1/1R5p/7P/6P1/r4PK1/8 w - - 0 40",
+            "8/pp3k2/2p2p2/5p2/2PP4/1P3P2/P4K2/8 w - - 0 35",
+            "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
+        ];
+        let transposition_table = TranspositionTable::new(16);
+        let stop_signal = AtomicBool::new(false);
+        let abort_signal = AtomicBool::new(false);
+        let nodes_searched = AtomicU64::new(0);
+        let mut total_nodes = 0;
+        let timer = Instant::now();
+        for fen in POSITIONS {
+            transposition_table.clear();
+            nodes_searched.store(0, Relaxed);
+            let context = SearchContext {
+                transposition_table: &transposition_table,
+                stop_signal: &stop_signal,
+                abort_signal: &abort_signal,
+                nodes_searched: &nodes_searched,
+            };
+            let mut search = Search::new(0);
+            search.print_info = false;
+            let limits = Limits {
+                depth: Some(depth),
+                ..Limits::default()
+            };
+            let result = search.search(&mut Board::from_fen(fen), &context, &limits);
+            let nodes = nodes_searched.load(Relaxed);
+            println!("{fen}: bestmove {} nodes {nodes}", result.best_move);
+            total_nodes += nodes;
+        }
+        let elapsed_ms = (timer.elapsed().as_millis() as u64).max(1);
+        println!(
+            "{total_nodes} nodes {} nps {elapsed_ms} ms",
+            total_nodes * 1000 / elapsed_ms
+        );
     }
 }
 
-fn is_mate_score(score: i32) -> bool {
-    score.abs() > Search::IMMEDIATE_MATE_SCORE - 100000
-}
-
-fn print_info(depth: u8, depth_best_ply: u8, score: i32, time: f64, nodes: u64) {
-    let mut out = stdout().lock();
-    if is_mate_score(score) {
-        let mate_in_ply = Search::IMMEDIATE_MATE_SCORE - score.abs();
-        writeln!(
-            out,
-            "info depth {} seldepth {} score mate {} time {} nodes {} nps {}",
-            depth + 1,
-            depth_best_ply + 1,
-            ((mate_in_ply + 1) / 2) * score.signum(),
-            (time * 1000.0).round() as u64,
-            nodes,
-            (nodes as f64 / time).round() as u64
-        )
-        .unwrap();
-    } else {
-        writeln!(
-            out,
-            "info depth {} seldepth {} score cp {} time {} nodes {} nps {}",
-            depth + 1,
-            depth_best_ply + 1,
-            score,
-            (time * 1000.0).round() as u64,
-            nodes,
-            (nodes as f64 / time).round() as u64
-        )
-        .unwrap();
+impl Drop for SearchThreads {
+    fn drop(&mut self) {
+        // Release the workers from the start barrier with the shutdown flag set, then join them
+        self.shared_state.shutdown.store(true, Relaxed);
+        self.shared_state.start_barrier.wait();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
-    out.flush().unwrap();
 }

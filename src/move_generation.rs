@@ -30,7 +30,7 @@ pub fn legal_moves(board: &Board) -> Moves {
 }
 
 pub struct MovesWithMetadata {
-    moves: [(Move, Option<u8>); 218],
+    pub(crate) moves: [(Move, Option<u8>); 218],
     pub(crate) length: usize,
     pub(crate) check: bool,
 }
@@ -61,6 +61,71 @@ impl MovesWithMetadata {
 }
 
 pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
+    generate_moves::<false>(board)
+}
+
+/// Whether the side to move is in check, without generating moves.
+pub fn in_check(board: &Board) -> bool {
+    const FILE_A: u64 = 0x0101_0101_0101_0101;
+    const FILE_H: u64 = FILE_A << 7;
+    let white = board.white_to_move();
+    let (friendly, enemy) = if white {
+        (board.white, board.black)
+    } else {
+        (board.black, board.white)
+    };
+    let king = (friendly & board.kings).trailing_zeros() as u8;
+    let king_mask = 1u64 << king;
+    let occupied = board.all_pieces();
+    // An enemy pawn checks us from where our own pawn on the king's square would attack
+    let pawn_checkers = if white {
+        ((king_mask << 7) & !FILE_H) | ((king_mask << 9) & !FILE_A)
+    } else {
+        ((king_mask >> 9) & !FILE_H) | ((king_mask >> 7) & !FILE_A)
+    };
+    pawn_checkers & board.pawns & enemy != 0
+        || move_lookup::possible_knight_moves(king) & board.knights & enemy != 0
+        || move_lookup::possible_bishop_moves(king, occupied)
+            & (board.bishops | board.queens)
+            & enemy
+            != 0
+        || move_lookup::possible_rook_moves(king, occupied) & (board.rooks | board.queens) & enemy
+            != 0
+}
+
+/// Captures and promotions only, unless in check (then every evasion). Used by quiescence.
+pub fn legal_captures_with_metadata(board: &Board) -> MovesWithMetadata {
+    generate_moves::<true>(board)
+}
+
+/// Fixed-capacity list of pin rays, so move generation doesn't allocate.
+struct PinRays {
+    rays: [u64; 8],
+    length: usize,
+}
+
+impl PinRays {
+    fn new() -> Self {
+        Self { rays: [0; 8], length: 0 }
+    }
+
+    fn push(&mut self, ray: u64) {
+        self.rays[self.length] = ray;
+        self.length += 1;
+    }
+
+}
+
+impl<'a> IntoIterator for &'a PinRays {
+    type Item = &'a u64;
+    type IntoIter = std::slice::Iter<'a, u64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rays[..self.length].iter()
+    }
+}
+
+fn generate_moves<const CAPTURES: bool>(board: &Board) -> MovesWithMetadata {
     let white = board.white_to_move();
     let friendly_pieces = if white { board.white } else { board.black };
     let enemy_pieces = if white { board.black } else { board.white };
@@ -80,7 +145,10 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
 
     // King moves are restricted by the danger mask
     let king_index = king_mask.trailing_zeros() as u8;
-    let pseudo_legal_king_moves = move_lookup::possible_king_moves(king_index) & !friendly_pieces;
+    // In captures-only mode (and not in check), only squares holding an enemy piece are targets
+    let target_mask = if CAPTURES && checkers == 0 { enemy_pieces } else { u64::MAX };
+    let pseudo_legal_king_moves =
+        move_lookup::possible_king_moves(king_index) & !friendly_pieces & target_mask;
     let legal_king_moves = pseudo_legal_king_moves & !king_danger_mask;
     for i in get_indices_of_bits(legal_king_moves) {
         moves.push((Move::regular(king_index, i), board.get_piece_at_square(i)));
@@ -120,7 +188,7 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
         } else if board.pawns & checker_mask != 0 || board.knights & checker_mask != 0 {
             block_mask = 0;
         }
-    } else {
+    } else if !CAPTURES {
         // Only if we're not in check are we allowed to castle
         let kingside_castle_blocker_mask = if white { 0x60 } else { 0x60 << 56 };
         if board.kingside_castling_available(white) // If kingside castling available
@@ -143,8 +211,8 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
 
     // Calculate pin rays
     // A piece is pinned if it is the only piece on the ray between a sliding attacker and the king
-    let mut cardinal_pin_rays = Vec::new();
-    let mut diagonal_pin_rays = Vec::new();
+    let mut cardinal_pin_rays = PinRays::new();
+    let mut diagonal_pin_rays = PinRays::new();
 
     let attacking_cardinal_sliders = king_rook_mask & enemy_pieces & (board.rooks | board.queens);
     for i in get_indices_of_bits(attacking_cardinal_sliders) {
@@ -190,9 +258,10 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
             if diagonal_pin_mask == u64::MAX {
                 let push_square = if white { i + 8 } else { i - 8 };
                 let push_mask = 1 << push_square;
-                if push_mask & !board.all_pieces() != 0 {
+                let final_rank = if white { 7 } else { 0 };
+                let quiet_allowed = target_mask == u64::MAX || push_square / 8 == final_rank;
+                if quiet_allowed && push_mask & !board.all_pieces() != 0 {
                     if push_mask & cardinal_pin_mask & block_mask != 0 {
-                        let final_rank = if white { 7 } else { 0 };
                         if push_square / 8 == final_rank {
                             moves.push((
                                 Move::pawn_promotion(i, push_square, piece_type::KNIGHT),
@@ -215,7 +284,7 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
                         }
                     }
                     let starting_rank = if white { 1 } else { 6 };
-                    if i / 8 == starting_rank {
+                    if target_mask == u64::MAX && i / 8 == starting_rank {
                         // Double pawn push
                         let double_push_square = if white { i + 16 } else { i - 16 };
                         let double_push_mask = 1 << double_push_square;
@@ -342,8 +411,10 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
             }
 
             let legal_end_squares = capture_mask | block_mask;
-            let knight_moves =
-                move_lookup::possible_knight_moves(i) & legal_end_squares & !friendly_pieces;
+            let knight_moves = move_lookup::possible_knight_moves(i)
+                & legal_end_squares
+                & !friendly_pieces
+                & target_mask;
             for j in get_indices_of_bits(knight_moves) {
                 moves.push((Move::regular(i, j), board.get_piece_at_square(j)));
             }
@@ -366,7 +437,8 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
             let legal_end_squares = (capture_mask | block_mask) & move_mask;
             let bishop_moves = move_lookup::possible_bishop_moves(i, board.all_pieces())
                 & legal_end_squares
-                & !friendly_pieces;
+                & !friendly_pieces
+                & target_mask;
             for j in get_indices_of_bits(bishop_moves) {
                 moves.push((Move::regular(i, j), board.get_piece_at_square(j)));
             }
@@ -389,7 +461,8 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
             let legal_end_squares = (capture_mask | block_mask) & move_mask;
             let rook_moves = move_lookup::possible_rook_moves(i, board.all_pieces())
                 & legal_end_squares
-                & !friendly_pieces;
+                & !friendly_pieces
+                & target_mask;
             for j in get_indices_of_bits(rook_moves) {
                 moves.push((Move::regular(i, j), board.get_piece_at_square(j)));
             }
@@ -415,7 +488,8 @@ pub fn legal_moves_with_metadata(board: &Board) -> MovesWithMetadata {
             let legal_end_squares = (capture_mask | block_mask) & move_mask;
             let queen_moves = move_lookup::possible_queen_moves(i, board.all_pieces())
                 & legal_end_squares
-                & !friendly_pieces;
+                & !friendly_pieces
+                & target_mask;
             for j in get_indices_of_bits(queen_moves) {
                 moves.push((Move::regular(i, j), board.get_piece_at_square(j)));
             }
@@ -490,15 +564,25 @@ fn king_danger_mask(
     (king_danger_mask, checkers, checker_index)
 }
 
-fn get_indices_of_bits(bits: u64) -> Vec<u8> {
-    let mut indices = Vec::new();
-    let mut bits = bits;
-    while bits != 0 {
-        let trailing_zeros = bits.trailing_zeros();
-        bits ^= 1 << trailing_zeros;
-        indices.push(trailing_zeros as u8);
+/// Iterates over the indices of the set bits, lowest first, without allocating.
+fn get_indices_of_bits(bits: u64) -> BitIndices {
+    BitIndices(bits)
+}
+
+struct BitIndices(u64);
+
+impl Iterator for BitIndices {
+    type Item = u8;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u8> {
+        if self.0 == 0 {
+            return None;
+        }
+        let index = self.0.trailing_zeros() as u8;
+        self.0 &= self.0 - 1;
+        Some(index)
     }
-    indices
 }
 
 #[cfg(test)]
@@ -509,8 +593,57 @@ mod tests {
     #[test]
     fn test_get_squares_of_moves() {
         let moves = 4462742033;
-        let squares = get_indices_of_bits(moves);
+        let squares: Vec<u8> = get_indices_of_bits(moves).collect();
         assert_eq!(squares, vec![0, 4, 9, 11, 25, 27, 32]);
+    }
+
+    #[test]
+    fn in_check_matches_move_generation() {
+        // Walk a few plies of every position and compare against the generator's check flag
+        fn walk(board: &mut Board, depth: usize) {
+            let moves = legal_moves_with_metadata(board);
+            assert_eq!(in_check(board), moves.check, "{board}");
+            if depth == 0 {
+                return;
+            }
+            for i in 0..moves.length {
+                let mov = moves.moves[i].0;
+                let metadata = board.make_move(&mov);
+                walk(board, depth - 1);
+                board.unmake_move(&mov, metadata);
+            }
+        }
+        for fen in [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        ] {
+            walk(&mut Board::from_fen(fen), 3);
+        }
+    }
+
+    #[test]
+    fn captures_only_matches_filtered_full_generation() {
+        for fen in [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ] {
+            let board = Board::from_fen(fen);
+            let full = legal_moves_with_metadata(&board);
+            let captures = legal_captures_with_metadata(&board);
+            let mut expected: Vec<u16> = full.moves[..full.length]
+                .iter()
+                .filter(|(m, c)| full.check || c.is_some() || m.flags() & 0b0100 != 0)
+                .map(|(m, _)| m.data)
+                .collect();
+            let mut actual: Vec<u16> =
+                captures.moves[..captures.length].iter().map(|(m, _)| m.data).collect();
+            expected.sort();
+            actual.sort();
+            assert_eq!(expected, actual, "{fen}");
+        }
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Cargo only reads [build] from here, not from Cargo.toml.
+# target-cpu=native lets the x86 PEXT intrinsic (BMI2) inline into the slider lookups.
+[build]
+rustflags = ["-C", "target-cpu=native"]

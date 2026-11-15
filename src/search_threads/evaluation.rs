@@ -1,211 +1,286 @@
 use crate::move_generation::mov::Move;
-use crate::move_generation::mov::squares::mask;
 use crate::move_generation::{Board, move_lookup};
+use crate::search_threads::eval_params::PARAMS;
 use std::cmp::max;
 
-macro_rules! piece_square_table {
-    (
-            $a8:expr, $b8:expr, $c8:expr, $d8:expr, $e8:expr, $f8:expr, $g8:expr, $h8:expr;
-            $a7:expr, $b7:expr, $c7:expr, $d7:expr, $e7:expr, $f7:expr, $g7:expr, $h7:expr;
-            $a6:expr, $b6:expr, $c6:expr, $d6:expr, $e6:expr, $f6:expr, $g6:expr, $h6:expr;
-            $a5:expr, $b5:expr, $c5:expr, $d5:expr, $e5:expr, $f5:expr, $g5:expr, $h5:expr;
-            $a4:expr, $b4:expr, $c4:expr, $d4:expr, $e4:expr, $f4:expr, $g4:expr, $h4:expr;
-            $a3:expr, $b3:expr, $c3:expr, $d3:expr, $e3:expr, $f3:expr, $g3:expr, $h3:expr;
-            $a2:expr, $b2:expr, $c2:expr, $d2:expr, $e2:expr, $f2:expr, $g2:expr, $h2:expr;
-            $a1:expr, $b1:expr, $c1:expr, $d1:expr, $e1:expr, $f1:expr, $g1:expr, $h1:expr;
-        ) => {
-        [
-            $a1, $b1, $c1, $d1, $e1, $f1, $g1, $h1, $a2, $b2, $c2, $d2, $e2, $f2, $g2, $h2, $a3,
-            $b3, $c3, $d3, $e3, $f3, $g3, $h3, $a4, $b4, $c4, $d4, $e4, $f4, $g4, $h4, $a5, $b5,
-            $c5, $d5, $e5, $f5, $g5, $h5, $a6, $b6, $c6, $d6, $e6, $f6, $g6, $h6, $a7, $b7, $c7,
-            $d7, $e7, $f7, $g7, $h7, $a8, $b8, $c8, $d8, $e8, $f8, $g8, $h8,
-        ]
-    };
+/// A (middlegame, endgame) score pair, blended by game phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct S(pub i32, pub i32);
+
+// Indices into `PARAMS`. Keep in sync with `eval_params.rs` (and `tune.rs`, which prints it).
+pub const MATERIAL: usize = 0;
+pub const PSQT: usize = MATERIAL + 6;
+pub const PASSED_PAWN: usize = PSQT + 6 * 64;
+pub const KNIGHT_MOBILITY: usize = PASSED_PAWN + 8;
+pub const BISHOP_MOBILITY: usize = KNIGHT_MOBILITY + 9;
+pub const ROOK_MOBILITY: usize = BISHOP_MOBILITY + 14;
+pub const QUEEN_MOBILITY: usize = ROOK_MOBILITY + 15;
+pub const BISHOP_PAIR: usize = QUEEN_MOBILITY + 28;
+pub const DOUBLED_PAWN: usize = BISHOP_PAIR + 1;
+pub const ISOLATED_PAWN: usize = DOUBLED_PAWN + 1;
+pub const ROOK_OPEN_FILE: usize = ISOLATED_PAWN + 1;
+pub const ROOK_SEMI_OPEN_FILE: usize = ROOK_OPEN_FILE + 1;
+pub const KING_SHIELD: usize = ROOK_SEMI_OPEN_FILE + 1;
+pub const KING_ATTACK: usize = KING_SHIELD + 1;
+pub const TEMPO: usize = KING_ATTACK + 4;
+pub const NUM_PARAMS: usize = TEMPO + 1;
+
+const _: () = assert!(NUM_PARAMS == PARAMS.len());
+
+/// Full game phase: every minor is 1, rook 2, queen 4 (PeSTO's weights).
+pub const MAX_PHASE: i32 = 24;
+
+/// Receives how often each parameter applies (white minus black). Used by the tuner; the
+/// search uses `NoTrace`, which compiles away.
+pub trait Trace {
+    fn add(&mut self, index: usize, count: i32);
 }
 
-const OPENING_PIECE_VALUES: [i32; 6] = [82, 337, 365, 477, 1025, 0];
-const ENDGAME_PIECE_VALUES: [i32; 6] = [94, 281, 297, 512, 936, 0];
+pub struct NoTrace;
 
-const OPENING_SQUARE_VALUES: [[i32; 64]; 6] = [
-    piece_square_table!(
-          0,   0,   0,   0,   0,   0,  0,   0;
-         98, 134,  61,  95,  68, 126, 34, -11;
-         -6,   7,  26,  31,  65,  56, 25, -20;
-        -14,  13,   6,  21,  23,  12, 17, -23;
-        -27,  -2,  -5,  12,  17,   6, 10, -25;
-        -26,  -4,  -4, -10,   3,   3, 33, -12;
-        -35,  -1, -20, -23, -15,  24, 38, -22;
-          0,   0,   0,   0,   0,   0,  0,   0;
-    ),
-    piece_square_table!(
-        -167, -89, -34, -49,  61, -97, -15, -107;
-         -73, -41,  72,  36,  23,  62,   7,  -17;
-         -47,  60,  37,  65,  84, 129,  73,   44;
-          -9,  17,  19,  53,  37,  69,  18,   22;
-         -13,   4,  16,  13,  28,  19,  21,   -8;
-         -23,  -9,  12,  10,  19,  17,  25,  -16;
-         -29, -53, -12,  -3,  -1,  18, -14,  -19;
-        -105, -21, -58, -33, -17, -28, -19,  -23;
-    ),
-    piece_square_table!(
-        -29,   4, -82, -37, -25, -42,   7,  -8;
-        -26,  16, -18, -13,  30,  59,  18, -47;
-        -16,  37,  43,  40,  35,  50,  37,  -2;
-         -4,   5,  19,  50,  37,  37,   7,  -2;
-         -6,  13,  13,  26,  34,  12,  10,   4;
-          0,  15,  15,  15,  14,  27,  18,  10;
-          4,  15,  16,   0,   7,  21,  33,   1;
-        -33,  -3, -14, -21, -13, -12, -39, -21;
-    ),
-    piece_square_table!(
-        32,  42,  32,  51, 63,  9,  31,  43;
-        27,  32,  58,  62, 80, 67,  26,  44;
-        -5,  19,  26,  36, 17, 45,  61,  16;
-       -24, -11,   7,  26, 24, 35,  -8, -20;
-       -36, -26, -12,  -1,  9, -7,   6, -23;
-       -45, -25, -16, -17,  3,  0,  -5, -33;
-       -44, -16, -20,  -9, -1, 11,  -6, -71;
-       -19, -13,   1,  17, 16,  7, -37, -26;
-    ),
-    piece_square_table!(
-        -28,   0,  29,  12,  59,  44,  43,  45;
-        -24, -39,  -5,   1, -16,  57,  28,  54;
-        -13, -17,   7,   8,  29,  56,  47,  57;
-        -27, -27, -16, -16,  -1,  17,  -2,   1;
-         -9, -26,  -9, -10,  -2,  -4,   3,  -3;
-        -14,   2, -11,  -2,  -5,   2,  14,   5;
-        -35,  -8,  11,   2,   8,  15,  -3,   1;
-         -1, -18,  -9,  10, -15, -25, -31, -50;
-    ),
-    piece_square_table!(
-        -65,  23,  16, -15, -56, -34,   2,  13;
-         29,  -1, -20,  -7,  -8,  -4, -38, -29;
-         -9,  24,   2, -16, -20,   6,  22, -22;
-        -17, -20, -12, -27, -30, -25, -14, -36;
-        -49,  -1, -27, -39, -46, -44, -33, -51;
-        -14, -14, -22, -46, -44, -30, -15, -27;
-          1,   7,  -8, -64, -43, -16,   9,   8;
-        -15,  36,  12, -54,   8, -28,  24,  14;
-    ),
-];
+impl Trace for NoTrace {
+    #[inline(always)]
+    fn add(&mut self, _: usize, _: i32) {}
+}
 
-const ENDGAME_SQUARE_VALUES: [[i32; 64]; 6] = [
-    piece_square_table!(
-        0,   0,   0,   0,   0,   0,   0,   0;
-      178, 173, 158, 134, 147, 132, 165, 187;
-       94, 100,  85,  67,  56,  53,  82,  84;
-       32,  24,  13,   5,  -2,   4,  17,  17;
-       13,   9,  -3,  -7,  -7,  -8,   3,  -1;
-        4,   7,  -6,   1,   0,  -5,  -1,  -8;
-       13,   8,   8,  10,  13,   0,   2,  -7;
-        0,   0,   0,   0,   0,   0,   0,   0;
-    ),
-    piece_square_table!(
-        -58, -38, -13, -28, -31, -27, -63, -99;
-        -25,  -8, -25,  -2,  -9, -25, -24, -52;
-        -24, -20,  10,   9,  -1,  -9, -19, -41;
-        -17,   3,  22,  22,  22,  11,   8, -18;
-        -18,  -6,  16,  25,  16,  17,   4, -18;
-        -23,  -3,  -1,  15,  10,  -3, -20, -22;
-        -42, -20, -10,  -5,  -2, -20, -23, -44;
-        -29, -51, -23, -15, -22, -18, -50, -64;
-    ),
-    piece_square_table!(
-        -14, -21, -11,  -8, -7,  -9, -17, -24;
-        -8,  -4,   7, -12, -3, -13,  -4, -14;
-         2,  -8,   0,  -1, -2,   6,   0,   4;
-        -3,   9,  12,   9, 14,  10,   3,   2;
-        -6,   3,  13,  19,  7,  10,  -3,  -9;
-       -12,  -3,   8,  10, 13,   3,  -7, -15;
-       -14, -18,  -7,  -1,  4,  -9, -15, -27;
-       -23,  -9, -23,  -5, -9, -16,  -5, -17;
-    ),
-    piece_square_table!(
-        13, 10, 18, 15, 12,  12,   8,   5;
-        11, 13, 13, 11, -3,   3,   8,   3;
-         7,  7,  7,  5,  4,  -3,  -5,  -3;
-         4,  3, 13,  1,  2,   1,  -1,   2;
-         3,  5,  8,  4, -5,  -6,  -8, -11;
-        -4,  0, -5, -1, -7, -12,  -8, -16;
-        -6, -6,  0,  2, -9,  -9, -11,  -3;
-        -9,  2,  3, -1, -5, -13,   4, -20;
-    ),
-    piece_square_table!(
-         -9,  22,  22,  27,  27,  19,  10,  20;
-        -17,  20,  32,  41,  58,  25,  30,   0;
-        -20,   6,   9,  49,  47,  35,  19,   9;
-          3,  22,  24,  45,  57,  40,  57,  36;
-        -18,  28,  19,  47,  31,  34,  39,  23;
-        -16, -27,  15,   6,   9,  17,  10,   5;
-        -22, -23, -30, -16, -16, -23, -36, -32;
-        -33, -28, -22, -43,  -5, -32, -20, -41;
-    ),
-    piece_square_table!(
-        -74, -35, -18, -18, -11,  15,   4, -17;
-        -12,  17,  14,  17,  17,  38,  23,  11;
-         10,  17,  23,  15,  20,  45,  44,  13;
-         -8,  22,  24,  27,  26,  33,  26,   3;
-        -18,  -4,  21,  24,  27,  23,   9, -11;
-        -19,  -3,  11,  21,  23,  16,   7,  -9;
-        -27, -11,   4,  13,  14,   4,  -5, -17;
-        -53, -34, -21, -11, -28, -14, -24, -43;
-    ),
-];
+struct Accumulator<'a, T: Trace> {
+    mg: i32,
+    eg: i32,
+    trace: &'a mut T,
+}
 
-pub(crate) fn evaluate(board: &Board) -> i32 {
-    let mut score = 0;
-    let pieces_left = board.white.count_ones() + board.black.count_ones();
-    for square in 0..64 {
-        let mask = mask(square);
-        if mask & board.all_pieces() == 0 {
-            continue;
-        }
-        let white = mask & board.white != 0;
-        let color_mult = if white { 1 } else { -1 };
-        let piece_square_lookup = if white {
-            square as usize
-        } else {
-            // Flip rank but keep file
-            ((7 - (square / 8)) * 8 + square % 8) as usize
-        };
-        let piece_type = if mask & board.pawns != 0 {
-            0
-        } else if mask & board.knights != 0 {
-            1
-        } else if mask & board.bishops != 0 {
-            2
-        } else if mask & board.rooks != 0 {
-            3
-        } else if mask & board.queens != 0 {
-            4
-        } else if mask & board.kings != 0 {
-            5
-        } else {
-            continue;
-        };
-        let value = get_value(piece_type, piece_square_lookup, pieces_left);
-        score += value * color_mult;
+impl<T: Trace> Accumulator<'_, T> {
+    #[inline(always)]
+    fn add(&mut self, index: usize, count: i32) {
+        let weight = PARAMS[index];
+        self.mg += weight.0 * count;
+        self.eg += weight.1 * count;
+        self.trace.add(index, count);
     }
-    score
 }
 
-fn get_value(piece_type: usize, square: usize, pieces_left: u32) -> i32 {
-    lerp_value(
-        OPENING_PIECE_VALUES[piece_type] + OPENING_SQUARE_VALUES[piece_type][square],
-        ENDGAME_PIECE_VALUES[piece_type] + ENDGAME_SQUARE_VALUES[piece_type][square],
-        pieces_left,
-    )
+const FILE_A: u64 = 0x0101_0101_0101_0101;
+const FILE_H: u64 = FILE_A << 7;
+
+const fn file_mask(file: usize) -> u64 {
+    FILE_A << file
 }
 
-fn lerp_value(opening: i32, endgame: i32, pieces_left: u32) -> i32 {
-    let a = opening;
-    let b = endgame;
-    // Remove kings from count
-    let t = pieces_left as i32 - 2;
-    (a * t + b * (30 - t)) / 30
+const fn adjacent_files(file: usize) -> u64 {
+    let mut mask = 0;
+    if file > 0 {
+        mask |= file_mask(file - 1);
+    }
+    if file < 7 {
+        mask |= file_mask(file + 1);
+    }
+    mask
 }
 
-const PIECE_VALUES: [i32; 6] = [100, 220, 430, 600, 1000, 20_000];
+/// passed_pawn_masks\[color\]\[square\]: squares ahead on the same and adjacent files, where an
+/// enemy pawn would stop the pawn from being passed. White is 0.
+const PASSED_PAWN_MASKS: [[u64; 64]; 2] = {
+    let mut masks = [[0; 64]; 2];
+    let mut square = 0;
+    while square < 64 {
+        let file = square % 8;
+        let rank = square / 8;
+        let files = file_mask(file) | adjacent_files(file);
+        let mut ahead_white = 0u64;
+        let mut ahead_black = 0u64;
+        let mut r = 0;
+        while r < 8 {
+            if r > rank {
+                ahead_white |= 0xFF << (r * 8);
+            }
+            if r < rank {
+                ahead_black |= 0xFF << (r * 8);
+            }
+            r += 1;
+        }
+        masks[0][square] = files & ahead_white;
+        masks[1][square] = files & ahead_black;
+        square += 1;
+    }
+    masks
+};
+
+#[inline(always)]
+pub fn pawn_attacks(white: bool, pawns: u64) -> u64 {
+    if white {
+        ((pawns << 7) & !FILE_H) | ((pawns << 9) & !FILE_A)
+    } else {
+        ((pawns >> 9) & !FILE_H) | ((pawns >> 7) & !FILE_A)
+    }
+}
+
+pub fn game_phase(board: &Board) -> i32 {
+    let phase = (board.knights | board.bishops).count_ones() as i32
+        + 2 * board.rooks.count_ones() as i32
+        + 4 * board.queens.count_ones() as i32;
+    phase.min(MAX_PHASE)
+}
+
+/// Static evaluation from white's point of view.
+pub(crate) fn evaluate(board: &Board) -> i32 {
+    evaluate_traced(board, &mut NoTrace)
+}
+
+pub fn evaluate_traced<T: Trace>(board: &Board, trace: &mut T) -> i32 {
+    let mut acc = Accumulator {
+        mg: 0,
+        eg: 0,
+        trace,
+    };
+    let occupied = board.all_pieces();
+    let pieces = [
+        board.pawns,
+        board.knights,
+        board.bishops,
+        board.rooks,
+        board.queens,
+        board.kings,
+    ];
+
+    for white in [true, false] {
+        let sign = if white { 1 } else { -1 };
+        let color = if white { 0 } else { 1 };
+        let (us, them) = if white {
+            (board.white, board.black)
+        } else {
+            (board.black, board.white)
+        };
+        let our_pawns = board.pawns & us;
+        let their_pawns = board.pawns & them;
+        let mobility_area = !us & !pawn_attacks(!white, their_pawns);
+        let their_king = (board.kings & them).trailing_zeros() as u8;
+        let king_zone = move_lookup::possible_king_moves(their_king) | (1 << their_king);
+        let relative = |square: usize| if white { square } else { square ^ 56 };
+
+        // Material and piece-square tables
+        for (piece, &bitboard) in pieces.iter().enumerate() {
+            let mut bits = bitboard & us;
+            acc.add(MATERIAL + piece, sign * bits.count_ones() as i32);
+            while bits != 0 {
+                let square = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                acc.add(PSQT + piece * 64 + relative(square), sign);
+            }
+        }
+
+        // Pawn structure
+        for file in 0..8 {
+            let on_file = (our_pawns & file_mask(file)).count_ones() as i32;
+            if on_file > 1 {
+                acc.add(DOUBLED_PAWN, sign * (on_file - 1));
+            }
+            if on_file > 0 && our_pawns & adjacent_files(file) == 0 {
+                acc.add(ISOLATED_PAWN, sign * on_file);
+            }
+        }
+        let mut pawns = our_pawns;
+        while pawns != 0 {
+            let square = pawns.trailing_zeros() as usize;
+            pawns &= pawns - 1;
+            if their_pawns & PASSED_PAWN_MASKS[color][square] == 0 {
+                acc.add(PASSED_PAWN + relative(square) / 8, sign);
+            }
+        }
+
+        if (board.bishops & us).count_ones() >= 2 {
+            acc.add(BISHOP_PAIR, sign);
+        }
+
+        // Mobility and attacks on the enemy king's zone
+        let mut knights = board.knights & us;
+        while knights != 0 {
+            let square = knights.trailing_zeros() as u8;
+            knights &= knights - 1;
+            let attacks = move_lookup::possible_knight_moves(square);
+            acc.add(
+                KNIGHT_MOBILITY + (attacks & mobility_area).count_ones() as usize,
+                sign,
+            );
+            acc.add(
+                KING_ATTACK,
+                sign * (attacks & king_zone).count_ones() as i32,
+            );
+        }
+        let mut bishops = board.bishops & us;
+        while bishops != 0 {
+            let square = bishops.trailing_zeros() as u8;
+            bishops &= bishops - 1;
+            let attacks = move_lookup::possible_bishop_moves(square, occupied);
+            acc.add(
+                BISHOP_MOBILITY + (attacks & mobility_area).count_ones() as usize,
+                sign,
+            );
+            acc.add(
+                KING_ATTACK + 1,
+                sign * (attacks & king_zone).count_ones() as i32,
+            );
+        }
+        let mut rooks = board.rooks & us;
+        while rooks != 0 {
+            let square = rooks.trailing_zeros() as u8;
+            rooks &= rooks - 1;
+            let attacks = move_lookup::possible_rook_moves(square, occupied);
+            acc.add(
+                ROOK_MOBILITY + (attacks & mobility_area).count_ones() as usize,
+                sign,
+            );
+            acc.add(
+                KING_ATTACK + 2,
+                sign * (attacks & king_zone).count_ones() as i32,
+            );
+            let file = file_mask(square as usize % 8);
+            if our_pawns & file == 0 {
+                if their_pawns & file == 0 {
+                    acc.add(ROOK_OPEN_FILE, sign);
+                } else {
+                    acc.add(ROOK_SEMI_OPEN_FILE, sign);
+                }
+            }
+        }
+        let mut queens = board.queens & us;
+        while queens != 0 {
+            let square = queens.trailing_zeros() as u8;
+            queens &= queens - 1;
+            let attacks = move_lookup::possible_queen_moves(square, occupied);
+            acc.add(
+                QUEEN_MOBILITY + (attacks & mobility_area).count_ones() as usize,
+                sign,
+            );
+            acc.add(
+                KING_ATTACK + 3,
+                sign * (attacks & king_zone).count_ones() as i32,
+            );
+        }
+
+        // Pawn shield in front of a king that is still on its back two ranks
+        let king = (board.kings & us).trailing_zeros() as usize;
+        let king_rank = relative(king) / 8;
+        if king_rank <= 1 {
+            let files = file_mask(king % 8) | adjacent_files(king % 8);
+            let ranks = if white {
+                0xFFFFu64 << ((king / 8 + 1) * 8)
+            } else {
+                0xFFFFu64 << ((king / 8).saturating_sub(2) * 8)
+            };
+            acc.add(
+                KING_SHIELD,
+                sign * (our_pawns & files & ranks).count_ones() as i32,
+            );
+        }
+    }
+
+    acc.add(TEMPO, if board.white_to_move() { 1 } else { -1 });
+
+    let phase = game_phase(board);
+    (acc.mg * phase + acc.eg * (MAX_PHASE - phase)) / MAX_PHASE
+}
+
+pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 20_000];
 
 pub fn mvv_lva(attacker: usize, victim: usize) -> i32 {
     PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker]
@@ -223,10 +298,15 @@ pub fn static_exchange_evaluation(board: &Board, mov: &Move) -> i32 {
     } else {
         match board.get_piece_at_square(mov.ending_index()) {
             Some(piece_type) => piece_type as usize,
-            None => return 0,
+            None => usize::MAX,
         }
     };
-    gain[0] = PIECE_VALUES[capture_type];
+    // Quiet moves start from nothing captured, so SEE says whether the square is safe
+    gain[0] = if capture_type == usize::MAX {
+        0
+    } else {
+        PIECE_VALUES[capture_type]
+    };
 
     let mut current_attacker_type =
         board.get_piece_at_square(mov.starting_index()).unwrap() as usize;
@@ -370,7 +450,7 @@ mod tests {
 
     #[test]
     fn see_values_capture_without_recapture() {
-        assert_eq!(see("4k3/8/8/8/3r4/2B5/8/4K3 w - - 0 1", 18, 27), 600);
+        assert_eq!(see("4k3/8/8/8/3r4/2B5/8/4K3 w - - 0 1", 18, 27), 500);
     }
 
     #[test]
@@ -380,7 +460,7 @@ mod tests {
 
     #[test]
     fn see_uses_the_correct_pawn_attack_direction() {
-        assert_eq!(see("4k3/8/8/3r4/4P3/8/8/4K3 w - - 0 1", 28, 35), 600);
-        assert_eq!(see("4k3/8/8/4p3/3R4/8/8/4K3 b - - 0 1", 36, 27), 600);
+        assert_eq!(see("4k3/8/8/3r4/4P3/8/8/4K3 w - - 0 1", 28, 35), 500);
+        assert_eq!(see("4k3/8/8/4p3/3R4/8/8/4K3 b - - 0 1", 36, 27), 500);
     }
 }

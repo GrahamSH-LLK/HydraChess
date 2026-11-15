@@ -3,6 +3,11 @@ use super::mov::piece_type;
 use super::mov::squares::*;
 use std::fmt;
 use std::fmt::Debug;
+use std::sync::LazyLock;
+
+/// Zobrist keys are shared by every board so that hashes stay comparable across `position`
+/// commands (otherwise the transposition table is unreachable after every move).
+static ZOBRIST_NUMBERS: LazyLock<ZobristNumbers> = LazyLock::new(ZobristNumbers::new);
 
 /// Represents the state of a chess board.
 ///
@@ -32,7 +37,7 @@ pub struct Board {
     /// - 1 bit: En passant target rank (white = 1)
     flags: u16,
     pub zobrist_hash: u64,
-    zobrist_numbers: ZobristNumbers,
+    zobrist_numbers: &'static ZobristNumbers,
     repetition_table: Vec<u64>,
 }
 
@@ -51,30 +56,44 @@ struct ZobristNumbers {
     en_passant_target: [[u64; 8]; 2],
 }
 
+/// Deterministic SplitMix64 generator for Zobrist keys.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
 impl ZobristNumbers {
     fn new() -> Self {
+        let mut rng = SplitMix64(0x4859_4452_4143_4845);
         Self {
             piece_square_hash: {
                 let mut piece_square_hash = [[[0; 6]; 2]; 64];
                 for piece in 0..6 {
                     for color in 0..2 {
                         for square in 0..64 {
-                            piece_square_hash[square][color][piece] = rand::random();
+                            piece_square_hash[square][color][piece] = rng.next();
                         }
                     }
                 }
                 piece_square_hash
             },
-            white_kingside_castling_rights: rand::random(),
-            white_queenside_castling_rights: rand::random(),
-            black_kingside_castling_rights: rand::random(),
-            black_queenside_castling_rights: rand::random(),
-            white_to_move: rand::random(),
+            white_kingside_castling_rights: rng.next(),
+            white_queenside_castling_rights: rng.next(),
+            black_kingside_castling_rights: rng.next(),
+            black_queenside_castling_rights: rng.next(),
+            white_to_move: rng.next(),
             en_passant_target: {
                 let mut en_passant_target = [[0; 8]; 2];
                 for color in 0..2 {
                     for square in 0..8 {
-                        en_passant_target[color][square] = rand::random();
+                        en_passant_target[color][square] = rng.next();
                     }
                 }
                 en_passant_target
@@ -207,7 +226,7 @@ impl Board {
         let halfmove_clock = substrings.next().unwrap().parse::<u8>().unwrap();
         // Fullmove clock is disregarded
 
-        let zobrist_numbers = ZobristNumbers::new();
+        let zobrist_numbers: &'static ZobristNumbers = &ZOBRIST_NUMBERS;
         // Load pieces into bitboards
         let mut rank = 7; // Start at the 8th rank
         let mut file = 0; // Start at the A-file
@@ -391,12 +410,52 @@ impl Board {
         }
     }
 
-    /// Count how many times this position has been seen in the game state.
-    pub fn times_played(&self) -> usize {
-        self.repetition_table
-            .iter()
-            .filter(|&&hash| hash == self.zobrist_hash)
-            .count()
+    /// Whether the current position already occurred earlier in the game or search.
+    ///
+    /// Only positions since the last irreversible move (bounded by the halfmove clock) with the
+    /// same side to move can repeat, so only those are scanned.
+    pub fn is_repetition(&self) -> bool {
+        let n = self.repetition_table.len();
+        if n == 0 {
+            return false;
+        }
+        let limit = (self.halfmove_clock as usize).min(n - 1);
+        let mut i = 4; // A repetition needs at least 4 plies
+        while i <= limit {
+            if self.repetition_table[n - 1 - i] == self.zobrist_hash {
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+
+    /// Whether the side to move has any piece other than pawns and the king.
+    pub fn has_non_pawn_material(&self) -> bool {
+        let friendly = if self.white_to_move() { self.white } else { self.black };
+        friendly & (self.knights | self.bishops | self.rooks | self.queens) != 0
+    }
+
+    /// Passes the turn (for null move pruning). Returns the state needed to undo it.
+    pub fn make_null_move(&mut self) -> (u8, u16, u64) {
+        let undo = (self.halfmove_clock, self.flags, self.zobrist_hash);
+        if let Some(target) = self.en_passant_target() {
+            let white = self.white_to_move();
+            self.zobrist_hash ^=
+                self.zobrist_numbers.en_passant_target[if white { 1 } else { 0 }][(target % 8) as usize];
+        }
+        self.flags &= !(0b11111 << 5);
+        self.flags ^= 1 << 4;
+        self.zobrist_hash ^= self.zobrist_numbers.white_to_move;
+        // Repetitions can't span a null move
+        self.halfmove_clock = 0;
+        self.repetition_table.push(self.zobrist_hash);
+        undo
+    }
+
+    pub fn unmake_null_move(&mut self, undo: (u8, u16, u64)) {
+        self.repetition_table.pop();
+        (self.halfmove_clock, self.flags, self.zobrist_hash) = undo;
     }
 
     /// Parse a UCI Long Algebraic Notation move string, and apply that move to the board.
