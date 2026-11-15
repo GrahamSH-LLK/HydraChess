@@ -1,9 +1,14 @@
+mod datagen;
 mod eval_params;
 mod evaluation;
+mod nnue;
 mod searcher;
+mod train;
 mod transposition_table;
 mod tune;
 
+pub use datagen::datagen;
+pub use train::train;
 pub use tune::tune;
 
 use super::move_generation;

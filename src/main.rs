@@ -38,6 +38,30 @@ fn main() {
         return;
     }
 
+    // `HydraChess datagen <out> [positions] [threads] [soft nodes]` writes self-play training data
+    if args.get(1).map(String::as_str) == Some("datagen") {
+        let Some(path) = args.get(2) else {
+            eprintln!("usage: HydraChess datagen <out file> [positions] [threads] [soft nodes]");
+            process::exit(2);
+        };
+        let positions = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(1_000_000);
+        let threads = args.get(4).and_then(|t| t.parse().ok()).unwrap_or(1);
+        let soft_nodes = args.get(5).and_then(|n| n.parse().ok()).unwrap_or(5000);
+        search_threads::datagen(path, positions, threads, soft_nodes);
+        return;
+    }
+
+    // `HydraChess train <out.nnue> <epochs> <data.bin>...` trains the NNUE
+    if args.get(1).map(String::as_str) == Some("train") {
+        let (Some(out), Some(epochs)) = (args.get(2), args.get(3).and_then(|e| e.parse().ok()))
+        else {
+            eprintln!("usage: HydraChess train <out.nnue> <epochs> <data.bin>...");
+            process::exit(2);
+        };
+        search_threads::train(out, epochs, &args[4..]);
+        return;
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdin_lines = stdin.lock().lines();

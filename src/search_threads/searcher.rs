@@ -2,6 +2,7 @@ use crate::move_generation;
 use crate::move_generation::mov::Move;
 use crate::move_generation::mov::piece_type::{KING, PAWN};
 use crate::move_generation::{Board, MovesWithMetadata};
+use crate::search_threads::nnue::{Accumulator, PieceBoards};
 use crate::search_threads::transposition_table::{EntryResult, TranspositionTable};
 use crate::search_threads::{SearchResult, evaluation};
 use minstant::Instant;
@@ -47,6 +48,8 @@ pub struct Limits {
     pub movetime_ms: Option<u64>,
     pub depth: Option<u8>,
     pub nodes: Option<u64>,
+    /// Don't start another iteration past this many nodes (this thread's own count)
+    pub soft_nodes: Option<u64>,
     pub infinite: bool,
 }
 
@@ -107,6 +110,8 @@ pub struct Search {
     /// The move a singular extension search leaves out, per ply
     excluded_moves: [Move; MAX_PLY + 1],
     root_best_move: Option<Move>,
+    /// NNUE accumulators per ply
+    accumulators: Vec<Accumulator>,
     /// Whether to print `info` lines (main thread only)
     pub print_info: bool,
 }
@@ -142,6 +147,7 @@ impl Search {
             move_stack: [PlyMove::NONE; MAX_PLY + 1],
             excluded_moves: [Move::null(); MAX_PLY + 1],
             root_best_move: None,
+            accumulators: vec![Accumulator::from_board(&Board::starting()); MAX_PLY + 2],
             print_info: id == 0,
         }
     }
@@ -219,6 +225,7 @@ impl Search {
             .flatten()
             .for_each(|h| *h /= 2);
         self.set_time_limits(limits);
+        self.accumulators[0] = Accumulator::from_board(board);
 
         let legal_moves = move_generation::legal_moves(board);
         if legal_moves.length == 0 {
@@ -290,6 +297,9 @@ impl Search {
                 }
             }
             previous_score = score;
+            if limits.soft_nodes.is_some_and(|soft| self.nodes >= soft) {
+                break;
+            }
         }
         self.flush_nodes(context);
         result
@@ -399,13 +409,12 @@ impl Search {
 
         let root = ply == 0;
         let pv_node = beta - alpha > 1;
-        let color = if board.white_to_move() { 1 } else { -1 };
         if !root {
             if board.get_halfmove_clock() >= 100 || board.is_repetition() {
                 return 0;
             }
             if ply >= MAX_PLY - 1 {
-                return evaluation::evaluate(board) * color;
+                return self.evaluate(board, ply);
             }
             // Mate distance pruning: no line from here can beat a mate we already found closer
             // to the root
@@ -472,7 +481,7 @@ impl Search {
         } else {
             static_eval = match tt_entry {
                 Some(entry) => entry.static_eval,
-                None => evaluation::evaluate(board) * color,
+                None => self.evaluate(board, ply),
             };
             eval = static_eval;
             if let Some(entry) = tt_entry
@@ -514,6 +523,7 @@ impl Search {
             {
                 let reduction = 3 + depth / 4 + ((eval - beta) / 200).min(3);
                 self.move_stack[ply] = PlyMove::NONE;
+                self.accumulators[ply + 1] = self.accumulators[ply];
                 let undo = board.make_null_move();
                 let score = -self.negamax(
                     board,
@@ -642,7 +652,7 @@ impl Search {
                 piece,
                 to: mov.ending_index() as usize,
             };
-            let metadata = board.make_move(&mov);
+            let metadata = self.make_move(board, &mov, ply);
             let new_depth = depth - 1 + extension;
             let score = if moves_searched == 0 {
                 -self.negamax(
@@ -804,9 +814,8 @@ impl Search {
         }
         self.count_node(context);
 
-        let color = if board.white_to_move() { 1 } else { -1 };
         if ply >= MAX_PLY - 1 {
-            return evaluation::evaluate(board) * color;
+            return self.evaluate(board, ply);
         }
         let pv_node = beta - alpha > 1;
 
@@ -842,7 +851,7 @@ impl Search {
         if !in_check {
             static_eval = match tt_entry {
                 Some(entry) => entry.static_eval,
-                None => evaluation::evaluate(board) * color,
+                None => self.evaluate(board, ply),
             };
             if static_eval >= beta {
                 return static_eval;
@@ -887,7 +896,7 @@ impl Search {
                 }
             }
 
-            let metadata = board.make_move(&mov);
+            let metadata = self.make_move(board, &mov, ply);
             let score = -self.quiescence(board, context, -beta, -alpha, ply + 1);
             board.unmake_move(&mov, metadata);
             if self.stopped {
@@ -922,6 +931,25 @@ impl Search {
             ),
         );
         best_score
+    }
+
+    /// Makes a move and updates the NNUE accumulator for the next ply.
+    #[inline(always)]
+    fn make_move(&mut self, board: &mut Board, mov: &Move, ply: usize) -> (u8, u16, u64, Option<u8>) {
+        let before = PieceBoards::of(board);
+        let metadata = board.make_move(mov);
+        let after = PieceBoards::of(board);
+        let mut removed = [(0, 0, 0); 4];
+        let mut added = [(0, 0, 0); 4];
+        let (r, a) = before.diff(&after, &mut removed, &mut added);
+        let (parents, children) = self.accumulators.split_at_mut(ply + 1);
+        children[0].update(&parents[ply], &removed[..r], &added[..a]);
+        metadata
+    }
+
+    #[inline(always)]
+    fn evaluate(&self, board: &Board, ply: usize) -> i32 {
+        self.accumulators[ply].evaluate(board.white_to_move(), board.all_pieces().count_ones())
     }
 
     /// The continuation-history key of the move made `back` plies before `ply`.
