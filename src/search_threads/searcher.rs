@@ -10,7 +10,7 @@ use std::cmp::{Reverse, max};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const MAX_DEPTH: u8 = 32;
+const MAX_DEPTH: u8 = 16;
 
 pub struct Search {
     pub(crate) nodes_searched: u64,
@@ -81,6 +81,9 @@ impl Search {
         'iterative_deepening: for depth in 0..MAX_DEPTH {
             if depth > 0 {
                 sorted_moves.sort_by_key(|&(_, eval)| Reverse(eval));
+                if search_id > 0 {
+                    sorted_moves[1..].shuffle(&mut rand::rng());
+                }
             }
 
             let mut depth_best_score = -i32::MAX;
@@ -305,16 +308,19 @@ impl Search {
                     nodes_searched,
                 )
             } else {
-                let mut move_extensions = extensions;
-                if depth > 2 && sorted_moves.len() > 4 && i > 2 {
-                    move_extensions -= 1;
-                }
+                let full_depth = max(0, depth as i8 + extensions) as u8;
+                let reduced = depth > 2 && sorted_moves.len() > 4 && i > 2;
+                let search_depth = if reduced {
+                    max(0, depth as i8 + extensions - 1) as u8
+                } else {
+                    full_depth
+                };
                 // Moves that aren't first probably aren't worth looking at, so do a null-window
-                // search with reduced depth to confirm that's the case
-                let pvs_reduced_depth = self.negamax(
+                // search (at reduced depth for late moves) to confirm that's the case
+                let mut result = self.negamax(
                     board,
                     transposition_table,
-                    max(0, depth as i8 + move_extensions) as u8,
+                    search_depth,
                     search_ply + 1,
                     -alpha - 1,
                     -alpha,
@@ -322,29 +328,36 @@ impl Search {
                     time_ok,
                     nodes_searched,
                 );
-                if let Some(pvs_reduced_depth) = pvs_reduced_depth {
-                    // If the move is not worth looking at, just return that search result
-                    let value = -pvs_reduced_depth.0;
-                    if value <= alpha {
-                        Some(pvs_reduced_depth)
-                    } else {
-                        // If it turns out it is worth looking at,
-                        // research with full depth and full window
-                        self.negamax(
-                            board,
-                            transposition_table,
-                            max(0, depth as i8 + extensions) as u8,
-                            search_ply + 1,
-                            -beta,
-                            -alpha,
-                            -color,
-                            time_ok,
-                            nodes_searched,
-                        )
-                    }
-                } else {
-                    None
+                // A reduced search beat alpha: verify at full depth, still with a null window
+                if reduced && result.is_some_and(|r| -r.0 > alpha) {
+                    result = self.negamax(
+                        board,
+                        transposition_table,
+                        full_depth,
+                        search_ply + 1,
+                        -alpha - 1,
+                        -alpha,
+                        -color,
+                        time_ok,
+                        nodes_searched,
+                    );
                 }
+                // Only a move that lands strictly inside (alpha, beta) needs an exact score.
+                // In null-window nodes beta == alpha + 1, so this never re-searches there.
+                if result.is_some_and(|r| -r.0 > alpha && -r.0 < beta) {
+                    result = self.negamax(
+                        board,
+                        transposition_table,
+                        full_depth,
+                        search_ply + 1,
+                        -beta,
+                        -alpha,
+                        -color,
+                        time_ok,
+                        nodes_searched,
+                    );
+                }
+                result
             };
 
             if search.is_none() {
@@ -359,11 +372,13 @@ impl Search {
             board.unmake_move(&mov, metadata);
             if value > best_value {
                 best_value = value;
-                best_move = mov;
                 best_searched_ply = searched_ply;
             }
             if value > alpha {
                 alpha = value;
+                // Only trust moves that actually raised alpha. In fail-low nodes every child score
+                // is just an upper bound, so storing those in TT poisons the move ordering.
+                best_move = mov;
                 evaluation_type = 0;
                 if alpha >= beta {
                     evaluation_type = -1;

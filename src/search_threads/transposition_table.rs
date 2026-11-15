@@ -79,10 +79,12 @@ impl TranspositionTable {
         let entry = &self.table[index];
         let data = Entry::data_from_entry_result(entry_result);
 
-        // Account for search_threads depth when overriding
+        // Keep a strictly deeper entry for the same position. An equal-depth entry is replaced so
+        // that a PVS re-search can overwrite the null-window bound it just produced with the
+        // exact score (and so fresher bounds win over stale ones).
         let current_data = entry.data.load(Ordering::Relaxed);
         if entry.zobrist_key_xor_data.load(Ordering::Relaxed) == zobrist_key ^ current_data
-            && EntryResult::from_u64(current_data).depth >= entry_result.depth
+            && EntryResult::from_u64(current_data).depth > entry_result.depth
         {
             return;
         }
@@ -129,5 +131,17 @@ mod tests {
         table.insert(0, shallow);
 
         assert_eq!(table.get(0), Some(deep));
+    }
+
+    #[test]
+    fn equal_depth_entry_replaces_existing_entry() {
+        let table = TranspositionTable::new(1);
+        let bound = EntryResult::new(6, 50, 1, Move::null());
+        let exact = EntryResult::new(6, 42, 0, Move::left_en_passant(10));
+
+        table.insert(0, bound);
+        table.insert(0, exact);
+
+        assert_eq!(table.get(0), Some(exact));
     }
 }
