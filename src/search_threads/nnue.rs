@@ -1,9 +1,33 @@
-//! NNUE evaluation: a (768 -> HIDDEN) x 2 perspective network with SCReLU and output buckets
-//! chosen by piece count. The accumulators are updated incrementally by the search.
+//! NNUE evaluation: a (768 x KING_BUCKETS -> HIDDEN) x 2 perspective network with SCReLU and
+//! output buckets chosen by piece count. The accumulators are updated incrementally by the search.
+//!
+//! Each perspective sees the board from its own side (its back rank is rank 1). With more than
+//! one king bucket, the board is also mirrored left-right when that side's king is on files e-h,
+//! and the input weights are chosen by the king's (mirrored) square through `KING_BUCKET_LAYOUT`.
 
 use crate::move_generation::Board;
 
-pub const INPUTS: usize = 768;
+/// Input weight sets, chosen by the perspective's own king square. 1 means no buckets and no
+/// mirroring: the plain 768-input net.
+pub const KING_BUCKETS: usize = 1;
+const MIRROR: bool = KING_BUCKETS > 1;
+/// Bucket of a king on the a-d files, by relative rank * 4 + file
+const KING_BUCKET_LAYOUT: [u8; 32] = if KING_BUCKETS == 1 {
+    [0; 32]
+} else {
+    [
+        0, 1, 2, 3, // rank 1: a1, b1, c1, d1
+        4, 4, 5, 5, // rank 2
+        6, 6, 6, 6, // rank 3
+        7, 7, 7, 7, // ranks 4-8
+        7, 7, 7, 7, //
+        7, 7, 7, 7, //
+        7, 7, 7, 7, //
+        7, 7, 7, 7, //
+    ]
+};
+const _: () = assert!(KING_BUCKETS == 1 || KING_BUCKETS == 8);
+pub const INPUTS: usize = 768 * KING_BUCKETS;
 pub const HIDDEN: usize = 256;
 pub const OUTPUT_BUCKETS: usize = 8;
 /// Quantization of the accumulator (and the [0, 1] SCReLU range)
@@ -31,14 +55,53 @@ pub fn network() -> &'static Network {
     &NET
 }
 
-/// Feature index of a piece seen from `perspective` (0 white, 1 black).
-#[inline(always)]
-pub fn feature(perspective: usize, color: usize, piece: usize, square: usize) -> usize {
-    if perspective == 0 {
-        (color != 0) as usize * 384 + piece * 64 + square
-    } else {
-        (color != 1) as usize * 384 + piece * 64 + (square ^ 56)
+/// How one perspective sees the board: which input weight set, and how squares are flipped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct View {
+    /// First input of the king bucket's weight set
+    base: u16,
+    /// XORed into squares: 56 flips black's view vertically, 7 mirrors left-right
+    flip: u8,
+}
+
+impl View {
+    /// The view of `perspective` (0 white, 1 black) whose king is on `king_square`.
+    #[inline(always)]
+    pub fn new(perspective: usize, king_square: usize) -> Self {
+        let mut flip = if perspective == 0 { 0 } else { 56 };
+        let relative = king_square ^ flip;
+        if MIRROR && relative % 8 >= 4 {
+            flip ^= 7;
+        }
+        // Mirroring leaves the king on files a-d, which is all the layout covers
+        let king = relative ^ (flip & 7);
+        let bucket = if MIRROR {
+            KING_BUCKET_LAYOUT[(king / 8) * 4 + king % 8] as usize
+        } else {
+            0
+        };
+        Self {
+            base: (bucket * 768) as u16,
+            flip: flip as u8,
+        }
     }
+
+    /// Feature index of a piece (color 0 white) seen through this view of `perspective`.
+    #[inline(always)]
+    pub fn feature(self, perspective: usize, color: usize, piece: usize, square: usize) -> usize {
+        self.base as usize
+            + (color != perspective) as usize * 384
+            + piece * 64
+            + (square ^ self.flip as usize)
+    }
+}
+
+/// Both perspectives' views of a board.
+#[inline(always)]
+pub fn views(board: &Board) -> [View; 2] {
+    let white_king = (board.kings & board.white).trailing_zeros() as usize;
+    let black_king = (board.kings & board.black).trailing_zeros() as usize;
+    [View::new(0, white_king), View::new(1, black_king)]
 }
 
 #[inline(always)]
@@ -46,11 +109,12 @@ pub fn output_bucket(piece_count: u32) -> usize {
     ((piece_count.saturating_sub(2)) as usize / 4).min(OUTPUT_BUCKETS - 1)
 }
 
-/// Both perspectives' hidden layer sums. White is 0.
+/// Both perspectives' hidden layer sums, and the views they were built with. White is 0.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Accumulator {
     pub values: [[i16; HIDDEN]; 2],
+    views: [View; 2],
 }
 
 impl Accumulator {
@@ -58,31 +122,49 @@ impl Accumulator {
         let net = network();
         let mut acc = Self {
             values: [net.feature_bias; 2],
+            views: views(board),
         };
-        for_each_piece(board, |color, piece, square| {
-            acc.add(net, color, piece, square);
-        });
+        for perspective in 0..2 {
+            acc.refresh(net, board, perspective);
+        }
         acc
     }
 
-    #[inline(always)]
-    fn add(&mut self, net: &Network, color: usize, piece: usize, square: usize) {
-        for perspective in 0..2 {
-            let weights = &net.feature_weights[feature(perspective, color, piece, square)];
-            for (v, w) in self.values[perspective].iter_mut().zip(weights) {
+    /// Rebuilds one perspective from scratch.
+    fn refresh(&mut self, net: &Network, board: &Board, perspective: usize) {
+        let view = self.views[perspective];
+        let out = &mut self.values[perspective];
+        out.copy_from_slice(&net.feature_bias);
+        for_each_piece(board, |color, piece, square| {
+            let weights = &net.feature_weights[view.feature(perspective, color, piece, square)];
+            for (v, w) in out.iter_mut().zip(weights) {
                 *v += *w;
             }
-        }
+        });
     }
 
-    /// Applies the difference between two boards (one move apart), given as removed and added
-    /// (color, piece, square) lists. Reads the parent once and writes the child once.
+    /// Moves from `parent` to the position now on `board`, one move later, given the pieces
+    /// removed and added as (color, piece, square). A perspective whose king changed bucket or
+    /// mirroring is rebuilt; the other is updated from the parent, reading it once and writing
+    /// the child once.
     #[inline(always)]
-    pub fn update(&mut self, parent: &Self, removed: &[(usize, usize, usize)], added: &[(usize, usize, usize)]) {
+    pub fn update(
+        &mut self,
+        parent: &Self,
+        board: &Board,
+        removed: &[(usize, usize, usize)],
+        added: &[(usize, usize, usize)],
+    ) {
         let net = network();
+        self.views = views(board);
         for perspective in 0..2 {
+            let view = self.views[perspective];
+            if view != parent.views[perspective] {
+                self.refresh(net, board, perspective);
+                continue;
+            }
             let row = |&(color, piece, square): &(usize, usize, usize)| {
-                &net.feature_weights[feature(perspective, color, piece, square)]
+                &net.feature_weights[view.feature(perspective, color, piece, square)]
             };
             let out = &mut self.values[perspective];
             let from = &parent.values[perspective];
@@ -289,5 +371,58 @@ impl PieceBoards {
             }
         }
         (r, a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Accumulator, PieceBoards};
+    use crate::move_generation::{self, Board};
+
+    /// Incremental updates must match a rebuild from scratch after every move, including king
+    /// moves that change bucket or cross the mirror line, castling, en passant and promotion.
+    #[test]
+    fn incremental_updates_match_a_full_refresh() {
+        move_generation::move_lookup::initialize();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let starts = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1pn1P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        ];
+        let mut checked = 0;
+        for fen in starts {
+            for _ in 0..40 {
+                let mut board = Board::from_fen(fen);
+                let mut acc = Accumulator::from_board(&board);
+                for _ in 0..120 {
+                    let moves = move_generation::legal_moves(&board);
+                    if moves.length == 0 {
+                        break;
+                    }
+                    let mov = moves.moves[(next() % moves.length as u64) as usize];
+                    let before = PieceBoards::of(&board);
+                    board.make_move(&mov);
+                    let after = PieceBoards::of(&board);
+                    let mut removed = [(0, 0, 0); 4];
+                    let mut added = [(0, 0, 0); 4];
+                    let (r, a) = before.diff(&after, &mut removed, &mut added);
+                    let parent = acc;
+                    acc.update(&parent, &board, &removed[..r], &added[..a]);
+                    let fresh = Accumulator::from_board(&board);
+                    assert_eq!(acc.values, fresh.values, "mismatch after {mov} in {board}");
+                    assert_eq!(acc.views, fresh.views);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000);
     }
 }

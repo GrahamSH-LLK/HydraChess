@@ -943,7 +943,7 @@ impl Search {
         let mut added = [(0, 0, 0); 4];
         let (r, a) = before.diff(&after, &mut removed, &mut added);
         let (parents, children) = self.accumulators.split_at_mut(ply + 1);
-        children[0].update(&parents[ply], &removed[..r], &added[..a]);
+        children[0].update(&parents[ply], board, &removed[..r], &added[..a]);
         metadata
     }
 

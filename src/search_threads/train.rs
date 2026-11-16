@@ -7,7 +7,7 @@
 
 use super::datagen::PackedPosition;
 use super::nnue::{
-    HIDDEN, INPUTS, Network, OUTPUT_BUCKETS, QA, QB, SCALE, feature, output_bucket,
+    HIDDEN, INPUTS, Network, OUTPUT_BUCKETS, QA, QB, SCALE, View, output_bucket,
 };
 use minstant::Instant;
 use std::fs;
@@ -61,6 +61,17 @@ fn load(paths: &[String]) -> Vec<PackedPosition> {
     positions
 }
 
+/// The side to move's view, then the other side's.
+fn position_views(position: &PackedPosition, stm: usize) -> [View; 2] {
+    let mut kings = [0; 2];
+    position.for_each_piece(|color, piece, square| {
+        if piece == 5 {
+            kings[color] = square;
+        }
+    });
+    [View::new(stm, kings[stm]), View::new(1 - stm, kings[1 - stm])]
+}
+
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -72,11 +83,12 @@ fn gradients(params: &[f32], batch: &[PackedPosition], grad: &mut [f32]) -> f64 
     let mut features = [[0usize; 32]; 2];
     for position in batch {
         let stm = position.side_to_move as usize;
+        let views = position_views(position, stm);
         let mut count = 0;
         position.for_each_piece(|color, piece, square| {
             // Perspective 0 is the side to move
-            features[0][count] = feature(stm, color, piece, square);
-            features[1][count] = feature(1 - stm, color, piece, square);
+            features[0][count] = views[0].feature(stm, color, piece, square);
+            features[1][count] = views[1].feature(1 - stm, color, piece, square);
             count += 1;
         });
         let bucket = output_bucket(count as u32);
@@ -279,10 +291,11 @@ pub fn train(out_path: &str, epochs: usize, data_paths: &[String]) {
 /// The unquantized network's evaluation in centipawns, side to move's view.
 fn float_eval(params: &[f32], position: &PackedPosition) -> f32 {
     let stm = position.side_to_move as usize;
+    let views = position_views(position, stm);
     let mut features = [Vec::new(), Vec::new()];
     position.for_each_piece(|color, piece, square| {
-        features[0].push(feature(stm, color, piece, square));
-        features[1].push(feature(1 - stm, color, piece, square));
+        features[0].push(views[0].feature(stm, color, piece, square));
+        features[1].push(views[1].feature(1 - stm, color, piece, square));
     });
     let bucket = output_bucket(features[0].len() as u32);
     let mut out = params[B2 + bucket];
