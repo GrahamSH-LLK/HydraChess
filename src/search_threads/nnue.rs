@@ -138,10 +138,41 @@ impl Accumulator {
     }
 }
 
+/// Sum of clamp(v, 0, QA)^2 * w. Computed as (clamp(v) * w) * clamp(v): the first product fits
+/// in an i16 because |w| <= 127 and v <= 255.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn screlu_dot(values: &[i16], weights: &[i16]) -> i32 {
-    // clamp(v)^2 * w = (clamp(v) * w) * clamp(v); the first product fits in an i16 because
-    // |w| <= 127 and v <= 255
+    use std::arch::aarch64::*;
+    const _: () = assert!(HIDDEN % 16 == 0);
+    debug_assert!(values.len() == HIDDEN && weights.len() == HIDDEN);
+    // SAFETY: NEON is always available on aarch64, and both slices hold HIDDEN elements, a
+    // multiple of 16, so every load is in bounds. Each i32 lane sums HIDDEN / 16 products of at
+    // most 255 * 255 * 127, which fits for HIDDEN up to several thousand.
+    unsafe {
+        let zero = vdupq_n_s16(0);
+        let max = vdupq_n_s16(QA as i16);
+        let mut acc = [vdupq_n_s32(0); 4];
+        let (v_ptr, w_ptr) = (values.as_ptr(), weights.as_ptr());
+        let mut i = 0;
+        while i < HIDDEN {
+            for half in 0..2 {
+                let v = vld1q_s16(v_ptr.add(i + 8 * half));
+                let w = vld1q_s16(w_ptr.add(i + 8 * half));
+                let clamped = vminq_s16(vmaxq_s16(v, zero), max);
+                let product = vmulq_s16(clamped, w);
+                acc[2 * half] = vmlal_s16(acc[2 * half], vget_low_s16(product), vget_low_s16(clamped));
+                acc[2 * half + 1] = vmlal_high_s16(acc[2 * half + 1], product, clamped);
+            }
+            i += 16;
+        }
+        vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn screlu_dot(values: &[i16], weights: &[i16]) -> i32 {
     let mut sum = [0i32; 16];
     for (v_chunk, w_chunk) in values.chunks_exact(16).zip(weights.chunks_exact(16)) {
         for i in 0..16 {
