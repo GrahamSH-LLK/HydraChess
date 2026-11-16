@@ -18,6 +18,8 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 
+from sparse_kernels import group_by_feature, sparse_affine
+
 INPUTS = 768
 OUTPUT_BUCKETS = 8
 QA, QB, SCALE = 255, 64, 400
@@ -83,15 +85,7 @@ def decode(batch):
     score = np.where(stm, -score, score)
     result = np.where(stm, 1 - result, result)
     target = (1 - WDL) / (1 + np.exp(-score / SCALE)) + WDL * result
-    return us, them, bucket, target.astype(np.float32)
-
-
-def one_hot(features):
-    """(batch, 32) feature indices, padded with INPUTS, to a dense (batch, INPUTS) 0/1 matrix."""
-    batch = features.shape[0]
-    rows = mx.broadcast_to(mx.arange(batch)[:, None], features.shape)
-    dense = mx.zeros((batch, INPUTS + 1)).at[rows.flatten(), features.flatten()].add(1.0)
-    return dense[:, :INPUTS]
+    return (us, them, bucket, target.astype(np.float32)) + group_by_feature(us) + group_by_feature(them)
 
 
 class Net(nn.Module):
@@ -107,19 +101,21 @@ class Net(nn.Module):
         self.w2 = mx.array(w2)
         self.b2 = mx.zeros((OUTPUT_BUCKETS,))
 
-    def accumulate(self, features):
-        # A dense 0/1 input times the weights: on the GPU a matmul is several times faster than
-        # gathering the 32 active rows and scattering their gradients back
-        return one_hot(features) @ self.w1 + self.b1
+    def accumulate(self, features, groups):
+        # Sums the active weight rows with a custom kernel. A dense one-hot matmul is about as
+        # fast here, but Apple's float32 matmul loses precision (errors around 1e-3)
+        return sparse_affine(self.w1, features, *groups) + self.b1
 
-    def __call__(self, us, them, bucket):
-        a = mx.concatenate([self.accumulate(us), self.accumulate(them)], axis=1)
+    def __call__(self, us, them, bucket, *groups):
+        a = mx.concatenate(
+            [self.accumulate(us, groups[:4]), self.accumulate(them, groups[4:])], axis=1
+        )
         a = mx.clip(a, 0, 1) ** 2
         return (a * self.w2[bucket]).sum(axis=1) + self.b2[bucket]
 
 
-def loss_fn(model, us, them, bucket, target):
-    predicted = mx.sigmoid(model(us, them, bucket))
+def loss_fn(model, us, them, bucket, target, *groups):
+    predicted = mx.sigmoid(model(us, them, bucket, *groups))
     return ((predicted - target) ** 2).mean()
 
 
@@ -165,8 +161,8 @@ def main():
     optimizer = optim.Adam(learning_rate=schedule, bias_correction=True)
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-    def step(us, them, bucket, target):
-        loss, grads = loss_and_grad(model, us, them, bucket, target)
+    def step(*batch):
+        loss, grads = loss_and_grad(model, *batch)
         optimizer.update(model, grads)
         model.w1 = mx.clip(model.w1, -CLIP, CLIP)
         model.w2 = mx.clip(model.w2, -CLIP, CLIP)
@@ -202,8 +198,8 @@ def main():
                 mx.eval(losses[-1])
         train_loss = float(mx.array(losses).mean().item())
         val_total = 0.0
-        for us, them, bucket, target in validation_batches:
-            val_total += float(loss_fn(model, us, them, bucket, target).item()) * len(target)
+        for batch in validation_batches:
+            val_total += float(loss_fn(model, *batch).item()) * batch[3].shape[0]
         val_loss = val_total / len(validation)
         print(
             f"epoch {epoch + 1} train {train_loss:.6f} validation {val_loss:.6f} "
