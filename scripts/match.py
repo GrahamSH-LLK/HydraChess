@@ -114,6 +114,9 @@ def sprt_worker(args, queue, seed):
     base = chess.engine.SimpleEngine.popen_uci(args.base)
     configure(new, args.threads, args.hash)
     configure(base, args.threads, args.hash)
+    if args.base_elo:
+        # Stockfish-style strength limit, for anchoring against a known rating
+        base.configure({"UCI_LimitStrength": True, "UCI_Elo": args.base_elo})
     base_time, increment = parse_tc(args.tc)
 
     def limit_for(board, clocks):
@@ -128,7 +131,7 @@ def sprt_worker(args, queue, seed):
 
     try:
         while True:
-            opening = random_opening(base, rng)
+            opening = random_opening(new, rng)
             # New engine as white, then as black; scores are from the new engine's side
             first, _ = play_game([new, base], opening, limit_for)
             second, _ = play_game([base, new], opening, limit_for)
@@ -198,7 +201,8 @@ def run_sprt(args):
                 f"llr {llr:.2f} ({lower:.2f}, {upper:.2f})",
                 flush=True,
             )
-            if args.fixed:
+            # The LLR is meaningless until the variance estimate settles
+            if args.fixed or pairs < 30:
                 continue
             if llr >= upper:
                 print("H1 accepted: the new engine is stronger")
@@ -279,6 +283,9 @@ def main():
         "--fixed", action="store_true", help="play all --max-pairs pairs, ignoring the SPRT bounds"
     )
     sprt.add_argument("--seed", type=int, default=1)
+    sprt.add_argument(
+        "--base-elo", type=int, default=None, help="limit BASE to this UCI_Elo (e.g. Stockfish)"
+    )
     sprt.add_argument("--threads", type=int, default=1, help="per engine, where supported")
     sprt.add_argument("--hash", type=int, default=16, help="MB per engine, where supported")
 
