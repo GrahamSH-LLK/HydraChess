@@ -170,7 +170,37 @@ fn screlu_dot(values: &[i16], weights: &[i16]) -> i32 {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn screlu_dot(values: &[i16], weights: &[i16]) -> i32 {
+    use std::arch::x86_64::*;
+    const _: () = assert!(HIDDEN % 16 == 0);
+    debug_assert!(values.len() == HIDDEN && weights.len() == HIDDEN);
+    // SAFETY: AVX2 is enabled at compile time (target-cpu=native), and both slices hold HIDDEN
+    // elements, a multiple of 16, so every unaligned load is in bounds. madd sums adjacent pairs
+    // into i32 lanes, which hold HIDDEN / 8 products of at most 255 * 255 * 127.
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let max = _mm256_set1_epi16(QA as i16);
+        let mut acc = _mm256_setzero_si256();
+        let (v_ptr, w_ptr) = (values.as_ptr(), weights.as_ptr());
+        let mut i = 0;
+        while i < HIDDEN {
+            let v = _mm256_loadu_si256(v_ptr.add(i) as *const __m256i);
+            let w = _mm256_loadu_si256(w_ptr.add(i) as *const __m256i);
+            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), max);
+            let product = _mm256_mullo_epi16(clamped, w);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(product, clamped));
+            i += 16;
+        }
+        let sum128 = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b01));
+        _mm_cvtsi128_si32(sum32)
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline(always)]
 fn screlu_dot(values: &[i16], weights: &[i16]) -> i32 {
     let mut sum = [0i32; 16];
