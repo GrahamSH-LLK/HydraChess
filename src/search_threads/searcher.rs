@@ -17,6 +17,15 @@ pub struct Search {
     killer_moves: [Option<Move>; MAX_DEPTH as usize],
 }
 
+pub struct SearchState<'a> {
+    pub transposition_table: &'a TranspositionTable,
+    pub stop_signal: &'a AtomicBool,
+    pub nodes_searched: &'a AtomicU64,
+    pub time_left_ms: u64,
+    pub increment: u64,
+    pub timer: Instant,
+}
+
 impl Search {
     pub fn new() -> Self {
         Self {
@@ -25,15 +34,18 @@ impl Search {
         }
     }
 
+    fn time_ok(search_state: &SearchState) -> bool {
+        let elapsed = search_state.timer.elapsed().as_millis() as u64;
+        !search_state.stop_signal.load(Relaxed)
+            && elapsed < (search_state.time_left_ms / 20 + search_state.increment / 2)
+            && elapsed < 10000
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn search(
         &mut self,
         board: &mut Board,
-        transposition_table: &TranspositionTable,
-        stop_signal: &AtomicBool,
-        time_left_ms: u64,
-        increment: u64,
-        nodes_searched: &AtomicU64,
+        search_state: &SearchState,
         search_id: usize,
     ) -> SearchResult {
         self.nodes_searched = 0;
@@ -55,7 +67,7 @@ impl Search {
         }
 
         let color = if board.white_to_move() { 1 } else { -1 };
-        let transposition_table_result = transposition_table.get(board.zobrist_hash);
+        let transposition_table_result = search_state.transposition_table.get(board.zobrist_hash);
         let mut tt_move = None;
         if let Some(result) = transposition_table_result {
             tt_move = Some(result.best_move);
@@ -72,12 +84,7 @@ impl Search {
         let mut best_ply = 0;
         let timer = Instant::now();
         let mut last_print_time = timer.elapsed().as_secs_f64();
-        let time_ok = || {
-            let elapsed = timer.elapsed().as_millis() as u64;
-            !stop_signal.load(Relaxed)
-                && elapsed < (time_left_ms / 20 + increment / 2)
-                && elapsed < 10000
-        };
+
         'iterative_deepening: for depth in 0..MAX_DEPTH {
             if depth > 0 {
                 sorted_moves.sort_by_key(|&(_, eval)| Reverse(eval));
@@ -96,28 +103,24 @@ impl Search {
                 let result = if i == 0 || depth < 2 {
                     self.negamax(
                         board,
-                        transposition_table,
+                        search_state,
                         depth,
                         0,
                         -i32::MAX,
                         -depth_best_score,
                         -color,
-                        &time_ok,
-                        nodes_searched,
                     )
                 } else {
                     // Moves that aren't the first one probably aren't as good, so do a null window search
                     // to confirm that they're not better than the best move
                     let pvs = self.negamax(
                         board,
-                        transposition_table,
+                        search_state,
                         depth,
                         0,
                         -depth_best_score - 1,
                         -depth_best_score,
                         -color,
-                        &time_ok,
-                        nodes_searched,
                     );
                     if let Some(pvs) = pvs {
                         // If the move's not worth looking at, just return that search result
@@ -128,14 +131,12 @@ impl Search {
                             // If it turns out it is actually better, we need a full search to quantify how much better
                             self.negamax(
                                 board,
-                                transposition_table,
+                                search_state,
                                 depth,
                                 0,
                                 -i32::MAX,
                                 -depth_best_score,
                                 -color,
-                                &time_ok,
-                                nodes_searched,
                             )
                         }
                     } else {
@@ -163,15 +164,15 @@ impl Search {
                 if search_id == 0 {
                     let score = if depth > 0 { best_score } else { 0 };
                     let time = timer.elapsed().as_secs_f64();
-                    let nodes =
-                        nodes_searched.load(Ordering::Relaxed) + (self.nodes_searched & 2047);
+                    let nodes = search_state.nodes_searched.load(Ordering::Relaxed)
+                        + (self.nodes_searched & 2047);
                     if timer.elapsed().as_secs_f64() - last_print_time > 0.05 {
                         print_info(depth, depth_best_ply, score, time, nodes);
                         last_print_time = timer.elapsed().as_secs_f64();
                     }
                 }
 
-                if !time_ok() {
+                if !Self::time_ok(search_state) {
                     break 'iterative_deepening;
                 }
             }
@@ -181,12 +182,14 @@ impl Search {
             best_ply = depth_best_ply;
             // We've reached the maximum depth, any further search is meaningless so exit early
             if depth + 1 == MAX_DEPTH {
-                stop_signal.store(true, Ordering::Relaxed);
+                search_state.stop_signal.store(true, Ordering::Relaxed);
                 break 'iterative_deepening;
             }
         }
 
-        nodes_searched.fetch_add(self.nodes_searched % 2047, Ordering::Relaxed);
+        search_state
+            .nodes_searched
+            .fetch_add(self.nodes_searched % 2047, Ordering::Relaxed);
         SearchResult {
             depth: best_depth,
             best_ply,
@@ -198,25 +201,21 @@ impl Search {
     pub(super) const IMMEDIATE_MATE_SCORE: i32 = i32::MAX / 2;
 
     #[allow(clippy::too_many_arguments)]
-    fn negamax<F>(
+    fn negamax(
         &mut self,
         board: &mut Board,
-        transposition_table: &TranspositionTable,
+        search_state: &SearchState,
         depth: u8,
         search_ply: u8,
         alpha: i32,
         beta: i32,
         color: i32,
-        time_ok: &F,
-        nodes_searched: &AtomicU64,
     ) -> Option<(i32, u8)>
-    where
-        F: Fn() -> bool,
     {
         if board.get_halfmove_clock() > 100 || board.times_played() >= 3 {
             return Some((0, search_ply));
         }
-        self.count_nodes(nodes_searched);
+        self.count_nodes(search_state.nodes_searched);
         let mut evaluation_type = 1;
 
         // Alpha can't possibly be worse than getting checkmated right now, if it is it means we already found a
@@ -237,7 +236,7 @@ impl Search {
             };
         }
 
-        let tt_result = transposition_table.get(board.zobrist_hash);
+        let tt_result = search_state.transposition_table.get(board.zobrist_hash);
         let mut tt_move = None;
         if let Some(tt_result) = tt_result {
             tt_move = Some(tt_result.best_move);
@@ -257,13 +256,12 @@ impl Search {
         if depth == 0 || search_ply >= MAX_DEPTH {
             return self.quiescence(
                 board,
+                search_state,
                 moves,
                 alpha,
                 beta,
                 search_ply + 1,
                 color,
-                time_ok,
-                nodes_searched,
             );
         }
 
@@ -288,7 +286,7 @@ impl Search {
         let mut best_value = -i32::MAX;
         let mut best_searched_ply = search_ply;
         for i in 0..sorted_moves.len() {
-            if !time_ok() {
+            if !Self::time_ok(search_state) {
                 return None;
             }
             let mov = sorted_moves[i];
@@ -298,14 +296,12 @@ impl Search {
             let search = if i == 0 || depth < 2 {
                 self.negamax(
                     board,
-                    transposition_table,
+                    search_state,
                     max(0, depth as i8 + extensions) as u8,
                     search_ply + 1,
                     -beta,
                     -alpha,
                     -color,
-                    time_ok,
-                    nodes_searched,
                 )
             } else {
                 let full_depth = max(0, depth as i8 + extensions) as u8;
@@ -319,27 +315,23 @@ impl Search {
                 // search (at reduced depth for late moves) to confirm that's the case
                 let mut result = self.negamax(
                     board,
-                    transposition_table,
+                    search_state,
                     search_depth,
                     search_ply + 1,
                     -alpha - 1,
                     -alpha,
                     -color,
-                    time_ok,
-                    nodes_searched,
                 );
                 // A reduced search beat alpha: verify at full depth, still with a null window
                 if reduced && result.is_some_and(|r| -r.0 > alpha) {
                     result = self.negamax(
                         board,
-                        transposition_table,
+                        search_state,
                         full_depth,
                         search_ply + 1,
                         -alpha - 1,
                         -alpha,
                         -color,
-                        time_ok,
-                        nodes_searched,
                     );
                 }
                 // Only a move that lands strictly inside (alpha, beta) needs an exact score.
@@ -347,14 +339,12 @@ impl Search {
                 if result.is_some_and(|r| -r.0 > alpha && -r.0 < beta) {
                     result = self.negamax(
                         board,
-                        transposition_table,
+                        search_state,
                         full_depth,
                         search_ply + 1,
                         -beta,
                         -alpha,
                         -color,
-                        time_ok,
-                        nodes_searched,
                     );
                 }
                 result
@@ -389,7 +379,7 @@ impl Search {
         }
 
         let tt_score = if evaluation_type == -1 { beta } else { alpha };
-        transposition_table.insert(
+        search_state.transposition_table.insert(
             board.zobrist_hash,
             EntryResult::new(depth, tt_score, evaluation_type, best_move),
         );
@@ -397,21 +387,18 @@ impl Search {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn quiescence<F>(
+    fn quiescence(
         &mut self,
         board: &mut Board,
+        search_state: &SearchState,
         moves: MovesWithMetadata,
         alpha: i32,
         beta: i32,
         search_ply: u8,
         color: i32,
-        time_ok: &F,
-        nodes_searched: &AtomicU64,
     ) -> Option<(i32, u8)>
-    where
-        F: Fn() -> bool,
     {
-        if !time_ok() {
+        if !Self::time_ok(search_state) {
             return None;
         }
 
@@ -419,7 +406,7 @@ impl Search {
             return Some((0, search_ply));
         }
 
-        self.count_nodes(nodes_searched);
+        self.count_nodes(search_state.nodes_searched);
 
         if moves.length == 0 {
             return if moves.check {
@@ -447,7 +434,7 @@ impl Search {
 
         let mut best_search_ply = search_ply;
         for mov in moves {
-            if !time_ok() {
+            if !Self::time_ok(search_state) {
                 return None;
             }
 
@@ -459,13 +446,12 @@ impl Search {
             let metadata = board.make_move(&mov);
             let result = self.quiescence(
                 board,
+                search_state,
                 move_generation::legal_moves_with_metadata(board),
                 -beta,
                 -alpha,
                 search_ply + 1,
                 -color,
-                time_ok,
-                nodes_searched,
             );
             board.unmake_move(&mov, metadata);
             result?;

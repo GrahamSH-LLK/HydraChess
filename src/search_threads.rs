@@ -5,7 +5,7 @@ mod transposition_table;
 use super::move_generation;
 use super::move_generation::Board;
 use crate::move_generation::mov::Move;
-use crate::search_threads::searcher::Search;
+use crate::search_threads::searcher::{Search, SearchState};
 use crate::search_threads::transposition_table::TranspositionTable;
 use minstant::Instant;
 use std::io::Write;
@@ -96,11 +96,14 @@ impl SearchThreads {
 
                     let result = search.search(
                         &mut board,
-                        &state.transposition_table,
-                        &stop_signal,
-                        state.time_left.load(Relaxed),
-                        state.increment.load(Relaxed),
-                        &state.nodes_searched,
+                        &SearchState {
+                            transposition_table: &state.transposition_table,
+                            stop_signal: &stop_signal,
+                            nodes_searched: &state.nodes_searched,
+                            time_left_ms: state.time_left.load(Relaxed),
+                            increment: state.increment.load(Relaxed),
+                            timer: Instant::now(),
+                        },
                         i,
                     );
 
