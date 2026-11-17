@@ -2,7 +2,7 @@ use crate::move_generation;
 use crate::move_generation::mov::Move;
 use crate::move_generation::mov::piece_type::{KING, PAWN};
 use crate::move_generation::{Board, MovesWithMetadata};
-use crate::search_threads::nnue::{Accumulator, PieceBoards};
+use crate::search_threads::nnue::{Accumulator, PieceBoards, RefreshCache};
 use crate::search_threads::transposition_table::{EntryResult, TranspositionTable};
 use crate::search_threads::{SearchResult, evaluation};
 use minstant::Instant;
@@ -35,6 +35,25 @@ const NO_PIECE: usize = usize::MAX;
 const PIECE_KEYS: usize = 12;
 const CONTINUATION_SIZE: usize = PIECE_KEYS * 64;
 
+/// Entries per correction history table
+const CORRECTION_SIZE: usize = 16_384;
+/// Correction entries stay within this
+const CORRECTION_LIMIT: i32 = 16_384;
+/// Divides the weighted correction sum (pawn x2 + both non-pawn) into centipawns, so the total
+/// correction is at most 4 * LIMIT / SCALE = 128 cp
+const CORRECTION_SCALE: i32 = 512;
+
+/// The most the static eval is taken to rise by capturing a pawn .. king, for delta pruning in
+/// quiescence. These are on the network's scale, not the SEE piece values: the net swings by
+/// far more than 100/320/330/500/900 on a capture, and with those values plus 200, 8% of the
+/// pruned captures (43% of queen captures) would have beaten alpha. With these under 1% do.
+const DELTA_PRUNING_GAIN: [i32; 6] = [500, 950, 950, 1300, 1900, 2 * MATE];
+
+/// Bounds on how far the soft limit's base may be scaled by best move stability, score drops
+/// and the best move's share of the nodes, which otherwise multiply up to over 4x
+const MIN_TIME_SCALE: f64 = 0.4;
+const MAX_TIME_SCALE: f64 = 2.5;
+
 /// What the GUI asked for in `go`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Limits {
@@ -51,6 +70,10 @@ pub struct Limits {
     /// Don't start another iteration past this many nodes (this thread's own count)
     pub soft_nodes: Option<u64>,
     pub infinite: bool,
+    /// Time kept back per move for communication lag
+    pub move_overhead_ms: u64,
+    /// Plies played in the game before this search
+    pub game_ply: usize,
 }
 
 /// State shared by all search threads.
@@ -101,6 +124,10 @@ pub struct Search {
     continuation_history: Vec<i32>,
     /// capture_history\[piece key\]\[to\]\[captured piece type\]
     capture_history: Box<[[[i32; 6]; 64]; PIECE_KEYS]>,
+    /// How far the static eval tends to be off, by side to move and pawn structure
+    pawn_correction: Box<[[i32; CORRECTION_SIZE]; 2]>,
+    /// The same by side to move and each color's non-pawn pieces: \[side\]\[color\]\[key\]
+    non_pawn_correction: Box<[[[i32; CORRECTION_SIZE]; 2]; 2]>,
     principal_variation: Box<[[Move; MAX_PLY]; MAX_PLY]>,
     principal_variation_length: [usize; MAX_PLY],
     late_move_reductions: Box<[[i32; 64]; 64]>,
@@ -109,9 +136,21 @@ pub struct Search {
     move_stack: [PlyMove; MAX_PLY + 1],
     /// The move a singular extension search leaves out, per ply
     excluded_moves: [Move; MAX_PLY + 1],
+    /// Double extensions on the path to each ply, to keep the tree from exploding
+    double_extensions: [i32; MAX_PLY + 1],
     root_best_move: Option<Move>,
-    /// NNUE accumulators per ply
+    /// Nodes spent under each root move this search, by from * 64 + to
+    root_move_nodes: Box<[u64; 4096]>,
+    /// NNUE accumulators per ply. They are brought up to date lazily, only when a position is
+    /// evaluated: a node that returns before evaluating (TT cutoff, draw, a TT static eval)
+    /// never pays for its update.
     accumulators: Vec<Accumulator>,
+    /// Whether each ply's accumulator matches the current path; ply 0 always does
+    accumulator_ready: Vec<bool>,
+    /// The update each ply's accumulator still needs from its parent's
+    pending_updates: Vec<PendingUpdate>,
+    /// King bucket refreshes start from here instead of from scratch
+    refresh_cache: RefreshCache,
     /// Whether to print `info` lines (main thread only)
     pub print_info: bool,
 }
@@ -140,14 +179,21 @@ impl Search {
             counter_moves: Box::new([[Move::null(); 64]; PIECE_KEYS]),
             continuation_history: vec![0; CONTINUATION_SIZE * CONTINUATION_SIZE],
             capture_history: Box::new([[[0; 6]; 64]; PIECE_KEYS]),
+            pawn_correction: Box::new([[0; CORRECTION_SIZE]; 2]),
+            non_pawn_correction: Box::new([[[0; CORRECTION_SIZE]; 2]; 2]),
             principal_variation: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
             principal_variation_length: [0; MAX_PLY],
             late_move_reductions,
             eval_stack: [0; MAX_PLY + 1],
             move_stack: [PlyMove::NONE; MAX_PLY + 1],
             excluded_moves: [Move::null(); MAX_PLY + 1],
+            double_extensions: [0; MAX_PLY + 1],
             root_best_move: None,
+            root_move_nodes: Box::new([0; 4096]),
             accumulators: vec![Accumulator::from_board(&Board::starting()); MAX_PLY + 2],
+            accumulator_ready: vec![false; MAX_PLY + 2],
+            pending_updates: vec![PendingUpdate::NONE; MAX_PLY + 2],
+            refresh_cache: RefreshCache::new(),
             print_info: id == 0,
         }
     }
@@ -168,6 +214,12 @@ impl Search {
             .flatten()
             .flatten()
             .for_each(|h| *h = 0);
+        self.pawn_correction.iter_mut().flatten().for_each(|c| *c = 0);
+        self.non_pawn_correction
+            .iter_mut()
+            .flatten()
+            .flatten()
+            .for_each(|c| *c = 0);
     }
 
     fn is_main(&self) -> bool {
@@ -184,17 +236,27 @@ impl Search {
         if !self.is_main() || limits.infinite {
             return;
         }
-        const MOVE_OVERHEAD_MS: u64 = 20;
+        let overhead = limits.move_overhead_ms;
         if let Some(movetime) = limits.movetime_ms {
-            let limit = movetime.saturating_sub(MOVE_OVERHEAD_MS).max(1);
+            let limit = movetime.saturating_sub(overhead).max(1);
             self.soft_limit_ms = limit;
             self.hard_limit_ms = limit;
         } else if let Some(time_left) = limits.time_left_ms {
-            let available = time_left.saturating_sub(MOVE_OVERHEAD_MS).max(1);
-            let soft = available / 40 + limits.increment_ms * 3 / 4;
-            let hard = (available / 8 + limits.increment_ms).max(soft);
-            self.soft_limit_ms = soft.min(available).max(1);
-            self.hard_limit_ms = hard.min(available).max(1);
+            let available = time_left.saturating_sub(overhead).max(1) as f64;
+            let increment = limits.increment_ms as f64;
+            let move_number = limits.game_ply / 2 + 1;
+            // Expect fewer moves left as the game goes on, but always plan for at least 30
+            let moves_left = (60.0 - move_number as f64 / 2.0).max(30.0);
+            // The opening is mostly known territory: start at a quarter of the budget and reach
+            // the full budget by move 16
+            let ramp = (0.2 + 0.05 * move_number as f64).min(1.0);
+            let base = (available / moves_left + increment * 0.75) * ramp;
+            // The iterative-deepening scaling may stretch the soft limit to MAX_SCALE times
+            // this; the hard limit stops a runaway iteration a little after that
+            let soft = base.min(available * 0.5);
+            let hard = (base * (MAX_TIME_SCALE + 1.0)).min(available * 0.3 + increment * 0.75);
+            self.soft_limit_ms = (soft as u64).max(1);
+            self.hard_limit_ms = (hard as u64).max(self.soft_limit_ms).min(available as u64).max(1);
         }
     }
 
@@ -209,6 +271,7 @@ impl Search {
         self.flushed_nodes = 0;
         self.stopped = false;
         self.root_best_move = None;
+        self.root_move_nodes.fill(0);
         self.killer_moves = [[Move::null(); 2]; MAX_PLY + 1];
         self.move_stack = [PlyMove::NONE; MAX_PLY + 1];
         self.excluded_moves = [Move::null(); MAX_PLY + 1];
@@ -226,6 +289,7 @@ impl Search {
             .for_each(|h| *h /= 2);
         self.set_time_limits(limits);
         self.accumulators[0] = Accumulator::from_board(board);
+        self.accumulator_ready[0] = true;
 
         let legal_moves = move_generation::legal_moves(board);
         if legal_moves.length == 0 {
@@ -291,6 +355,13 @@ impl Search {
                 if depth > 1 && score < previous_score - 30 {
                     scale *= 1.25;
                 }
+                // And less when most of the effort already goes into the best move
+                if depth >= 6 && self.nodes > 0 {
+                    let best_nodes = self.root_move_nodes[root_move_index(&best_move)];
+                    let fraction = best_nodes as f64 / self.nodes as f64;
+                    scale *= (1.5 - fraction) * 1.25;
+                }
+                let scale = scale.clamp(MIN_TIME_SCALE, MAX_TIME_SCALE);
                 let soft_limit = (self.soft_limit_ms as f64 * scale) as u64;
                 if self.elapsed_ms() >= soft_limit.min(self.hard_limit_ms) {
                     break;
@@ -410,7 +481,10 @@ impl Search {
         let root = ply == 0;
         let pv_node = beta - alpha > 1;
         if !root {
-            if board.get_halfmove_clock() >= 100 || board.is_repetition() {
+            if board.get_halfmove_clock() >= 100
+                || board.is_repetition()
+                || board.is_insufficient_material()
+            {
                 return 0;
             }
             if ply >= MAX_PLY - 1 {
@@ -472,6 +546,8 @@ impl Search {
         // Static evaluation, reused from the TT when possible and sharpened by a TT bound
         let static_eval;
         let mut eval;
+        // The network's eval, before correction; the TT stores this one
+        let mut raw_eval = -INFINITY;
         if in_check {
             static_eval = -INFINITY;
             eval = -INFINITY;
@@ -479,10 +555,11 @@ impl Search {
             static_eval = self.eval_stack[ply];
             eval = static_eval;
         } else {
-            static_eval = match tt_entry {
+            raw_eval = match tt_entry {
                 Some(entry) => entry.static_eval,
                 None => self.evaluate(board, ply),
             };
+            static_eval = self.corrected_eval(board, raw_eval);
             eval = static_eval;
             if let Some(entry) = tt_entry
                 && tt_score.abs() < MATE_BOUND
@@ -523,7 +600,13 @@ impl Search {
             {
                 let reduction = 3 + depth / 4 + ((eval - beta) / 200).min(3);
                 self.move_stack[ply] = PlyMove::NONE;
-                self.accumulators[ply + 1] = self.accumulators[ply];
+                self.double_extensions[ply + 1] = self.double_extensions[ply];
+                // The null move's child has the same pieces: a copy, once it's needed
+                self.pending_updates[ply + 1] = PendingUpdate {
+                    boards: PieceBoards::of(board),
+                    ..PendingUpdate::NONE
+                };
+                self.accumulator_ready[ply + 1] = false;
                 let undo = board.make_null_move();
                 let score = -self.negamax(
                     board,
@@ -540,6 +623,70 @@ impl Search {
                 }
                 if score >= beta {
                     return if score >= MATE_BOUND { beta } else { score };
+                }
+            }
+
+            // ProbCut: a capture that beats beta by a margin in a reduced search almost surely
+            // beats beta at full depth
+            let probcut_beta = beta + 200;
+            if depth >= 5
+                && beta.abs() < MATE_BOUND
+                && !tt_entry.is_some_and(|entry| {
+                    entry.depth as i32 >= depth - 3 && tt_score < probcut_beta
+                })
+            {
+                let mut captures = move_generation::legal_captures_with_metadata(board);
+                let mut scores = [0i32; 218];
+                for i in 0..captures.length {
+                    let (mov, capture) = captures.moves[i];
+                    scores[i] = self.capture_order_score(board, &mov, capture);
+                }
+                for i in 0..captures.length {
+                    let (mov, capture) = pick_next_move(&mut captures, &mut scores, i);
+                    if capture.is_none() && !is_queen_promotion(&mov) {
+                        continue;
+                    }
+                    if evaluation::static_exchange_evaluation(board, &mov) < probcut_beta - static_eval
+                    {
+                        continue;
+                    }
+                    self.move_stack[ply] = PlyMove {
+                        piece: piece_key(board, &mov),
+                        to: mov.ending_index() as usize,
+                    };
+                    self.double_extensions[ply + 1] = self.double_extensions[ply];
+                    let metadata = self.make_move(board, &mov, ply);
+                    // A quiescence search first, to drop captures that don't hold up cheaply
+                    let mut score =
+                        -self.quiescence(board, context, -probcut_beta, -probcut_beta + 1, ply + 1);
+                    if score >= probcut_beta {
+                        score = -self.negamax(
+                            board,
+                            context,
+                            depth - 4,
+                            ply + 1,
+                            -probcut_beta,
+                            -probcut_beta + 1,
+                            !cut_node,
+                        );
+                    }
+                    board.unmake_move(&mov, metadata);
+                    if self.stopped {
+                        return 0;
+                    }
+                    if score >= probcut_beta {
+                        context.transposition_table.insert(
+                            board.zobrist_hash,
+                            EntryResult::new(
+                                (depth - 3) as u8,
+                                score_to_tt(score, ply),
+                                raw_eval,
+                                LOWER_BOUND,
+                                mov,
+                            ),
+                        );
+                        return score;
+                    }
                 }
             }
         }
@@ -591,11 +738,15 @@ impl Search {
             if !root && best_score > -MATE_BOUND {
                 if is_quiet && !in_check {
                     // Late move pruning: quiet moves this late in the list rarely matter
-                    if !pv_node && depth <= 8 && quiet_count as i32 >= late_move_limit {
-                        continue;
-                    }
+                    let late = !pv_node && depth <= 8 && quiet_count as i32 >= late_move_limit;
                     // Futility pruning: too far below alpha for a quiet move to catch up
-                    if depth <= 6 && static_eval + 100 + 100 * depth <= alpha {
+                    let futile = depth <= 6 && static_eval + 100 + 100 * depth <= alpha;
+                    // History pruning: quiet moves that keep failing here aren't worth a look
+                    let bad_history = !pv_node && depth <= 4 && quiet_history < -3000 * depth;
+                    // None of that holds for a move that gives check: it is how a sacrifice
+                    // gets followed up, and the static eval says nothing about where it leads
+                    if (late || futile || bad_history) && !move_generation::gives_check(board, &mov)
+                    {
                         continue;
                     }
                 }
@@ -642,16 +793,25 @@ impl Search {
                 }
                 if score < singular_beta {
                     extension = 1;
+                    // Far below: the TT move is the only move by a wide margin
+                    if !pv_node && score < singular_beta - 20 && self.double_extensions[ply] < 6 {
+                        extension = 2;
+                    }
                 } else if singular_beta >= beta {
                     // Multi-cut: even without the TT move, more than one move beats beta
                     return singular_beta;
+                } else if tt_score >= beta || cut_node {
+                    // Other moves are nearly as good, so the TT move needs less depth
+                    extension = -1;
                 }
             }
+            self.double_extensions[ply + 1] = self.double_extensions[ply] + (extension >= 2) as i32;
 
             self.move_stack[ply] = PlyMove {
                 piece,
                 to: mov.ending_index() as usize,
             };
+            let nodes_before = self.nodes;
             let metadata = self.make_move(board, &mov, ply);
             let new_depth = depth - 1 + extension;
             let score = if moves_searched == 0 {
@@ -715,6 +875,9 @@ impl Search {
                 score
             };
             board.unmake_move(&mov, metadata);
+            if root {
+                self.root_move_nodes[root_move_index(&mov)] += self.nodes - nodes_before;
+            }
             if self.stopped {
                 return 0;
             }
@@ -791,11 +954,24 @@ impl Search {
                 EntryResult::new(
                     depth.clamp(0, u8::MAX as i32) as u8,
                     score_to_tt(best_score, ply),
-                    if in_check { 0 } else { static_eval },
+                    if in_check { 0 } else { raw_eval },
                     node_type,
                     best_move,
                 ),
             );
+            // Learn how far off the static eval was, when the search result says so: a quiet
+            // best move (captures are the search's business), and a bound on the right side
+            let best_is_quiet = best_move == Move::null()
+                || (board.get_piece_at_square(best_move.ending_index()).is_none()
+                    && !is_promotion(&best_move));
+            if !in_check
+                && best_is_quiet
+                && best_score.abs() < MATE_BOUND
+                && !(node_type == LOWER_BOUND && best_score <= static_eval)
+                && !(node_type == UPPER_BOUND && best_score >= static_eval)
+            {
+                self.update_correction(board, depth, best_score - static_eval);
+            }
         }
         best_score
     }
@@ -814,6 +990,10 @@ impl Search {
         }
         self.count_node(context);
 
+        // A capture into a bare king and minor piece is a dead draw, whatever the eval says
+        if board.is_insufficient_material() {
+            return 0;
+        }
         if ply >= MAX_PLY - 1 {
             return self.evaluate(board, ply);
         }
@@ -848,11 +1028,13 @@ impl Search {
         // Standing pat is only allowed when not in check; in check every evasion is searched
         let mut best_score = -INFINITY;
         let mut static_eval = -INFINITY;
+        let mut raw_eval = 0;
         if !in_check {
-            static_eval = match tt_entry {
+            raw_eval = match tt_entry {
                 Some(entry) => entry.static_eval,
                 None => self.evaluate(board, ply),
             };
+            static_eval = self.corrected_eval(board, raw_eval);
             if static_eval >= beta {
                 return static_eval;
             }
@@ -886,7 +1068,7 @@ impl Search {
                 if let Some(victim) = capture {
                     // Delta pruning: even winning this piece for free can't reach alpha
                     if !is_promotion(&mov)
-                        && static_eval + evaluation::PIECE_VALUES[victim as usize] + 200 <= alpha
+                        && static_eval + DELTA_PRUNING_GAIN[victim as usize] <= alpha
                     {
                         continue;
                     }
@@ -925,7 +1107,7 @@ impl Search {
             EntryResult::new(
                 0,
                 score_to_tt(best_score, ply),
-                if in_check { 0 } else { static_eval },
+                raw_eval,
                 node_type,
                 best_move,
             ),
@@ -933,23 +1115,71 @@ impl Search {
         best_score
     }
 
-    /// Makes a move and updates the NNUE accumulator for the next ply.
+    /// Makes a move and records the NNUE update the next ply's accumulator will need.
     #[inline(always)]
     fn make_move(&mut self, board: &mut Board, mov: &Move, ply: usize) -> (u8, u16, u64, Option<u8>) {
         let before = PieceBoards::of(board);
         let metadata = board.make_move(mov);
-        let after = PieceBoards::of(board);
-        let mut removed = [(0, 0, 0); 4];
-        let mut added = [(0, 0, 0); 4];
-        let (r, a) = before.diff(&after, &mut removed, &mut added);
-        let (parents, children) = self.accumulators.split_at_mut(ply + 1);
-        children[0].update(&parents[ply], board, &removed[..r], &added[..a]);
+        let pending = &mut self.pending_updates[ply + 1];
+        pending.boards = PieceBoards::of(board);
+        let (r, a) = before.diff(&pending.boards, &mut pending.removed, &mut pending.added);
+        pending.counts = (r as u8, a as u8);
+        self.accumulator_ready[ply + 1] = false;
         metadata
     }
 
+    /// Applies the pending updates from the nearest up-to-date ply down to `ply`.
     #[inline(always)]
-    fn evaluate(&self, board: &Board, ply: usize) -> i32 {
+    fn ensure_accumulator(&mut self, ply: usize) {
+        let mut ready = ply;
+        while !self.accumulator_ready[ready] {
+            ready -= 1;
+        }
+        for i in ready + 1..=ply {
+            let (parents, children) = self.accumulators.split_at_mut(i);
+            let pending = &self.pending_updates[i];
+            let (r, a) = (pending.counts.0 as usize, pending.counts.1 as usize);
+            children[0].update(
+                &parents[i - 1],
+                &pending.boards,
+                &pending.removed[..r],
+                &pending.added[..a],
+                &mut self.refresh_cache,
+            );
+            self.accumulator_ready[i] = true;
+        }
+    }
+
+    #[inline(always)]
+    fn evaluate(&mut self, board: &Board, ply: usize) -> i32 {
+        self.ensure_accumulator(ply);
         self.accumulators[ply].evaluate(board.white_to_move(), board.all_pieces().count_ones())
+    }
+
+    /// The static eval adjusted by the correction histories.
+    #[inline(always)]
+    fn corrected_eval(&self, board: &Board, raw_eval: i32) -> i32 {
+        let side = !board.white_to_move() as usize;
+        let keys = correction_keys(board);
+        let correction = self.pawn_correction[side][keys[0]] * 2
+            + self.non_pawn_correction[side][0][keys[1]]
+            + self.non_pawn_correction[side][1][keys[2]];
+        (raw_eval + correction / CORRECTION_SCALE).clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
+    }
+
+    /// Moves the correction histories toward the search result's difference from the static eval.
+    fn update_correction(&mut self, board: &Board, depth: i32, difference: i32) {
+        let side = !board.white_to_move() as usize;
+        let keys = correction_keys(board);
+        // A depth-16 result moves the total correction about all the way to it
+        let bonus =
+            (difference * depth.min(16) * 2).clamp(-CORRECTION_LIMIT / 8, CORRECTION_LIMIT / 8);
+        let update = |entry: &mut i32| {
+            *entry += bonus - *entry * bonus.abs() / CORRECTION_LIMIT;
+        };
+        update(&mut self.pawn_correction[side][keys[0]]);
+        update(&mut self.non_pawn_correction[side][0][keys[1]]);
+        update(&mut self.non_pawn_correction[side][1][keys[2]]);
     }
 
     /// The continuation-history key of the move made `back` plies before `ply`.
@@ -1066,6 +1296,54 @@ impl Search {
         }
         self.principal_variation_length[ply] = child_length + 1;
     }
+}
+
+/// An accumulator update waiting to be applied: the pieces after the move, and the pieces it
+/// removed and added as (color, piece, square).
+#[derive(Clone, Copy)]
+struct PendingUpdate {
+    boards: PieceBoards,
+    removed: [(usize, usize, usize); 4],
+    added: [(usize, usize, usize); 4],
+    counts: (u8, u8),
+}
+
+impl PendingUpdate {
+    const NONE: Self = Self {
+        boards: PieceBoards::EMPTY,
+        removed: [(0, 0, 0); 4],
+        added: [(0, 0, 0); 4],
+        counts: (0, 0),
+    };
+}
+
+fn root_move_index(mov: &Move) -> usize {
+    mov.starting_index() as usize * 64 + mov.ending_index() as usize
+}
+
+/// Correction history indices: pawn structure, then white's and black's non-pawn pieces.
+#[inline(always)]
+fn correction_keys(board: &Board) -> [usize; 3] {
+    #[inline(always)]
+    fn mix(x: u64, seed: u64) -> u64 {
+        // The top bits of a multiply depend on every input bit; the low bits don't
+        let x = (x ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (x ^ (x >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+    }
+    const SHIFT: u32 = 64 - CORRECTION_SIZE.trailing_zeros();
+    let pawns = mix(board.pawns & board.white, 1) ^ mix(board.pawns & board.black, 2);
+    let pieces = |color: u64| {
+        mix(board.knights & color, 3)
+            ^ mix(board.bishops & color, 4)
+            ^ mix(board.rooks & color, 5)
+            ^ mix(board.queens & color, 6)
+            ^ mix(board.kings & color, 7)
+    };
+    [
+        (pawns >> SHIFT) as usize,
+        (pieces(board.white) >> SHIFT) as usize,
+        (pieces(board.black) >> SHIFT) as usize,
+    ]
 }
 
 /// History gravity keeps values within ±MAX_HISTORY.

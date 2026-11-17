@@ -93,9 +93,6 @@ impl Rng {
     }
 }
 
-fn insufficient_material(board: &Board) -> bool {
-    board.pawns | board.rooks | board.queens == 0 && (board.knights | board.bishops).count_ones() <= 1
-}
 
 pub fn datagen(path: &str, target_positions: u64, threads: usize, soft_nodes: u64) {
     move_generation::move_lookup::initialize();
@@ -225,7 +222,7 @@ fn play_game(
                 1
             };
         }
-        if board.get_halfmove_clock() >= 100 || board.is_repetition() || insufficient_material(&board)
+        if board.get_halfmove_clock() >= 100 || board.is_repetition() || board.is_insufficient_material()
         {
             break 1;
         }

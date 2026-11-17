@@ -9,6 +9,7 @@ so `HIDDEN` in nnue.rs must match `--hidden`.
 
 import argparse
 import math
+import os
 import queue
 import threading
 import time
@@ -40,12 +41,16 @@ assert RECORD.itemsize == 32
 
 
 def load(paths):
-    parts = []
-    for path in paths:
-        data = np.fromfile(path, dtype=np.uint8)
-        data = data[: len(data) // 32 * 32]
-        parts.append(data.view(RECORD))
-    return np.concatenate(parts)
+    # Read straight into one array, so the files aren't held twice while concatenating
+    sizes = [os.path.getsize(path) // 32 for path in paths]
+    out = np.empty(sum(sizes), dtype=RECORD)
+    raw = out.view(np.uint8)
+    offset = 0
+    for path, size in zip(paths, sizes):
+        with open(path, "rb") as f:
+            f.readinto(memoryview(raw[offset * 32 : (offset + size) * 32]))
+        offset += size
+    return out
 
 
 def decode(batch):
@@ -177,10 +182,22 @@ def main():
     ]
 
     # Decode batches on CPU threads while the GPU trains on earlier ones
+    orders = {}
+    orders_lock = threading.Lock()
+
+    def epoch_order(epoch):
+        # One shared order per epoch; only the current and next epochs are kept
+        with orders_lock:
+            if epoch not in orders:
+                rng = np.random.default_rng((args.seed, epoch))
+                orders[epoch] = rng.permutation(len(training)).astype(np.uint32)
+                for old in [e for e in orders if e < epoch - 1]:
+                    del orders[old]
+            return orders[epoch]
+
     def producer(out, worker, workers):
         for epoch in range(args.epochs):
-            # Every worker derives the same order for an epoch, without storing them all
-            order = np.random.default_rng((args.seed, epoch)).permutation(len(training))
+            order = epoch_order(epoch)
             for b in range(worker, batches_per_epoch, workers):
                 out[b % workers].put(decode(training[order[b * args.batch : (b + 1) * args.batch]]))
 

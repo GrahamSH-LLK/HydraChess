@@ -24,6 +24,8 @@ pub struct Board {
     pub kings: u64,
     /// Halfmove clock
     halfmove_clock: u8,
+    /// Plies played before the FEN this board was set up from (from its fullmove number)
+    start_ply: u16,
     /// Miscellaneous information about the board state.
     ///
     /// From least significant bit:
@@ -224,6 +226,8 @@ impl Board {
         let castling_rights = substrings.next().unwrap();
         let en_passant_target = substrings.next().unwrap();
         let halfmove_clock = substrings.next().unwrap().parse::<u8>().unwrap();
+        let fullmove = substrings.next().and_then(|n| n.parse::<u16>().ok()).unwrap_or(1).max(1);
+        let start_ply = 2 * (fullmove - 1) + (white_to_move == "b") as u16;
         // Fullmove clock is disregarded
 
         let zobrist_numbers: &'static ZobristNumbers = &ZOBRIST_NUMBERS;
@@ -329,10 +333,12 @@ impl Board {
             queens,
             kings,
             halfmove_clock,
+            start_ply,
             flags,
             zobrist_hash,
             zobrist_numbers,
-            repetition_table: Vec::new(),
+            // The starting position is part of the history too: returning to it is a repetition
+            repetition_table: vec![zobrist_hash],
         }
     }
 
@@ -369,6 +375,12 @@ impl Board {
 
     pub fn all_pieces(&self) -> u64 {
         self.white | self.black
+    }
+
+    /// Plies played in the game so far: the FEN's move number plus the moves made since.
+    pub fn game_ply(&self) -> usize {
+        // The history holds the starting position and one entry per move since
+        self.start_ply as usize + self.repetition_table.len() - 1
     }
 
     pub fn get_halfmove_clock(&self) -> u8 {
@@ -428,6 +440,12 @@ impl Board {
             i += 2;
         }
         false
+    }
+
+    /// Whether neither side can ever checkmate: kings alone, or with a single knight or bishop.
+    pub fn is_insufficient_material(&self) -> bool {
+        self.pawns | self.rooks | self.queens == 0
+            && (self.knights | self.bishops).count_ones() <= 1
     }
 
     /// Whether the side to move has any piece other than pawns and the king.
@@ -1003,7 +1021,7 @@ impl Board {
     ///
     /// Takes the last flag value before the move.
     fn unmake_double_pawn_push(&mut self, mov: &Move) {
-        self.repetition_table.pop();
+        // unmake_move already popped the history entry
 
         let start_mask = mov.starting_mask();
         let end_mask = mov.ending_mask();
@@ -1085,7 +1103,7 @@ impl Board {
     ///
     /// Takes the last flag value before the move.
     fn unmake_en_passant(&mut self, mov: &Move) {
-        self.repetition_table.pop();
+        // unmake_move already popped the history entry
 
         let start_mask = mov.starting_mask();
         let end_mask = mov.ending_mask();
@@ -1180,14 +1198,24 @@ impl Board {
         // Clear en passant flags
         self.flags &= !(0b11111 << 5);
 
+        // Castling gives up both rights, but only the ones still held are in the hash: the
+        // other may already be gone (its rook moved or was captured)
         if white {
+            if self.kingside_castling_available(true) {
+                self.zobrist_hash ^= self.zobrist_numbers.white_kingside_castling_rights;
+            }
+            if self.queenside_castling_available(true) {
+                self.zobrist_hash ^= self.zobrist_numbers.white_queenside_castling_rights;
+            }
             self.flags &= !0b11;
-            self.zobrist_hash ^= self.zobrist_numbers.white_kingside_castling_rights;
-            self.zobrist_hash ^= self.zobrist_numbers.white_queenside_castling_rights;
         } else {
+            if self.kingside_castling_available(false) {
+                self.zobrist_hash ^= self.zobrist_numbers.black_kingside_castling_rights;
+            }
+            if self.queenside_castling_available(false) {
+                self.zobrist_hash ^= self.zobrist_numbers.black_queenside_castling_rights;
+            }
             self.flags &= !0b1100;
-            self.zobrist_hash ^= self.zobrist_numbers.black_kingside_castling_rights;
-            self.zobrist_hash ^= self.zobrist_numbers.black_queenside_castling_rights;
         }
 
         self.repetition_table.push(self.zobrist_hash);
@@ -1196,7 +1224,7 @@ impl Board {
     }
 
     fn unmake_castle(&mut self, mov: &Move) {
-        self.repetition_table.pop();
+        // unmake_move already popped the history entry
 
         let white = self.white & mov.ending_mask() != 0;
         let kingside = mov.ending_index() % 8 == 6;
@@ -1561,5 +1589,120 @@ mod tests {
         // Test unmake black queenside castle
         board.unmake_move(&mov, metadata);
         assert_eq!(board, start_board);
+    }
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::Board;
+
+    const LICHESS_MOVES: &str = "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8c5 c2c3 c5a7 d2d4 e8g8 c1g5 h7h6 g5h4 e5d4 d1c1 d7d6 a4c6 b7c6 c3d4 g7g5 f3g5 h6g5 c1g5 g8h7 f1d1 f8g8 g5f6 d8f6 h4f6 c8h3 g2g3 h7g6 e4e5 g8b8 b2b3 b8b4 b1a3 b4d4 a3c2 d4d1 a1d1 a8e8 c2b4 d6e5 b4c6 e8e6 c6a7 e6f6 d1c1 f6d6 c1c6 h3d7 c6c7 d6d2 a2a4 f7f6 b3b4 d7h3 c7c1 d2a2 a4a5 a2b2 a7c6 g6f7 c1e1 h3d7 e1c1 d7h3 c1e1 h3d7 e1c1 d7h3";
+
+    fn play(moves: &str) -> Board {
+        crate::move_generation::move_lookup::initialize();
+        let mut board = Board::starting();
+        for mov in moves.split_whitespace() {
+            board.move_from_uci_lan(mov);
+        }
+        board
+    }
+
+    /// Knights out and back: the start position again with the same side to move.
+    #[test]
+    fn shuffling_knights_repeats() {
+        let board = play("g1f3 g8f6 f3g1 f6g8");
+        assert_eq!(board.zobrist_hash, Board::starting().zobrist_hash);
+        assert!(board.is_repetition());
+    }
+
+    /// The threefold repetition the bot walked into on Lichess (game 1twkyJOj): 36...Bh3 and
+    /// 38...Bh3 reach the same position.
+    #[test]
+    fn lichess_game_repetition() {
+        let board = play(LICHESS_MOVES);
+        assert!(board.is_repetition(), "final position should be a repetition");
+    }
+
+    /// The same, but the last two moves made the way the search makes them: from move
+    /// generation through make_move, after cloning the root board.
+    #[test]
+    fn search_style_repetition() {
+        let all: Vec<&str> = LICHESS_MOVES.split_whitespace().collect();
+        let root = play(&all[..all.len() - 2].join(" "));
+        let mut board = root.clone();
+        for uci in &all[all.len() - 2..] {
+            let moves = crate::move_generation::legal_moves(&board);
+            let mov = moves.moves[..moves.length]
+                .iter()
+                .find(|m| m.to_string() == *uci)
+                .copied()
+                .unwrap_or_else(|| panic!("{uci} not generated"));
+            board.make_move(&mov);
+        }
+        assert!(board.is_repetition());
+    }
+
+    /// The incrementally updated hash must equal the hash of the same position set up from its
+    /// FEN, after every kind of move. Castling with one right already lost used to toggle the
+    /// lost right's key back in, so the same position hashed differently by move order.
+    #[test]
+    fn incremental_hash_matches_fen_hash() {
+        crate::move_generation::move_lookup::initialize();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            // One right already gone on each side, so castling must leave the other key alone
+            "r3k2r/8/8/8/8/8/8/R3K2R w Kq - 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R b Qk - 0 1",
+        ];
+        let mut castles = 0;
+        for fen in fens {
+            for _ in 0..200 {
+                let mut board = Board::from_fen(fen);
+                for _ in 0..60 {
+                    let moves = crate::move_generation::legal_moves(&board);
+                    if moves.length == 0 {
+                        break;
+                    }
+                    let mov = moves.moves[(next() % moves.length as u64) as usize];
+                    castles += (mov.flags() == 0b0010) as usize;
+                    board.make_move(&mov);
+                    let fresh = Board::from_fen(&board.to_string());
+                    assert_eq!(board.zobrist_hash, fresh.zobrist_hash, "after {mov}: {board}");
+                }
+            }
+        }
+        assert!(castles > 100, "only {castles} castling moves were exercised");
+    }
+
+    /// Making and unmaking every kind of move must leave the history as it was. Unmaking a
+    /// double pawn push, castle or en passant used to pop two entries, which erased the game
+    /// history during search and hid repetitions.
+    #[test]
+    fn unmake_restores_history() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1pn1P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+        ];
+        crate::move_generation::move_lookup::initialize();
+        for fen in fens {
+            let mut board = Board::from_fen(fen);
+            let before = board.game_ply();
+            let moves = crate::move_generation::legal_moves(&board);
+            for mov in &moves.moves[..moves.length] {
+                let metadata = board.make_move(mov);
+                assert_eq!(board.game_ply(), before + 1, "after {mov} in {fen}");
+                board.unmake_move(mov, metadata);
+                assert_eq!(board.game_ply(), before, "after unmaking {mov} in {fen}");
+            }
+        }
     }
 }

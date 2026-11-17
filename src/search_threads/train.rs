@@ -43,7 +43,12 @@ impl Rng {
 }
 
 fn load(paths: &[String]) -> Vec<PackedPosition> {
-    let mut positions = Vec::new();
+    // Reserve exactly, so a few hundred million positions don't double the memory on growth
+    let total: u64 = paths
+        .iter()
+        .map(|path| fs::metadata(path).map_or(0, |m| m.len() / 32))
+        .sum();
+    let mut positions = Vec::with_capacity(total as usize);
     for path in paths {
         let bytes = fs::read(path).unwrap_or_else(|e| panic!("can't read {path}: {e}"));
         for chunk in bytes.chunks_exact(32) {

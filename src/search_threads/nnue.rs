@@ -1,16 +1,17 @@
 //! NNUE evaluation: a (768 x KING_BUCKETS -> HIDDEN) x 2 perspective network with SCReLU and
 //! output buckets chosen by piece count. The accumulators are updated incrementally by the search.
 //!
-//! Each perspective sees the board from its own side (its back rank is rank 1). With more than
-//! one king bucket, the board is also mirrored left-right when that side's king is on files e-h,
-//! and the input weights are chosen by the king's (mirrored) square through `KING_BUCKET_LAYOUT`.
+//! Each perspective sees the board from its own side (its back rank is rank 1), mirrored
+//! left-right when that side's king is on files e-h, and the input weights are chosen by the
+//! king's (mirrored) square through `KING_BUCKET_LAYOUT`. This matches bullet's
+//! `ChessBucketsMirrored` inputs, which mirror even with a single bucket.
 
 use crate::move_generation::Board;
 
-/// Input weight sets, chosen by the perspective's own king square. 1 means no buckets and no
-/// mirroring: the plain 768-input net.
-pub const KING_BUCKETS: usize = 1;
-const MIRROR: bool = KING_BUCKETS > 1;
+/// Input weight sets, chosen by the perspective's own king square
+pub const KING_BUCKETS: usize = 8;
+/// Nets up to net3 were trained without mirroring; bullet-trained nets need it
+const MIRROR: bool = true;
 /// Bucket of a king on the a-d files, by relative rank * 4 + file
 const KING_BUCKET_LAYOUT: [u8; 32] = if KING_BUCKETS == 1 {
     [0; 32]
@@ -28,7 +29,7 @@ const KING_BUCKET_LAYOUT: [u8; 32] = if KING_BUCKETS == 1 {
 };
 const _: () = assert!(KING_BUCKETS == 1 || KING_BUCKETS == 8);
 pub const INPUTS: usize = 768 * KING_BUCKETS;
-pub const HIDDEN: usize = 256;
+pub const HIDDEN: usize = 512;
 pub const OUTPUT_BUCKETS: usize = 8;
 /// Quantization of the accumulator (and the [0, 1] SCReLU range)
 pub const QA: i32 = 255;
@@ -96,12 +97,47 @@ impl View {
     }
 }
 
-/// Both perspectives' views of a board.
-#[inline(always)]
-pub fn views(board: &Board) -> [View; 2] {
-    let white_king = (board.kings & board.white).trailing_zeros() as usize;
-    let black_king = (board.kings & board.black).trailing_zeros() as usize;
-    [View::new(0, white_king), View::new(1, black_king)]
+impl View {
+    /// Which refresh cache slot this view uses: one per king bucket and mirroring.
+    #[inline(always)]
+    fn cache_slot(self) -> usize {
+        (self.base as usize / 768) * 2 + (self.flip & 7 != 0) as usize
+    }
+}
+
+/// A perspective's accumulator as last built for one king bucket and mirroring, and the pieces
+/// it was built from.
+#[derive(Clone)]
+#[repr(C, align(64))]
+struct CacheEntry {
+    values: [i16; HIDDEN],
+    boards: [u64; 12],
+}
+
+/// Accumulators kept per perspective, king bucket and mirroring (a "Finny table"). When a king
+/// move changes a perspective's bucket, that perspective starts from the cached accumulator for
+/// the new bucket and only applies the pieces that differ, instead of adding up every piece.
+/// Each entry always matches its stored boards, so the cache never needs clearing.
+pub struct RefreshCache {
+    entries: Box<[[CacheEntry; 2 * KING_BUCKETS]; 2]>,
+}
+
+impl RefreshCache {
+    pub fn new() -> Self {
+        let empty = CacheEntry {
+            values: network().feature_bias,
+            boards: [0; 12],
+        };
+        Self {
+            entries: Box::new(std::array::from_fn(|_| std::array::from_fn(|_| empty.clone()))),
+        }
+    }
+}
+
+impl Default for RefreshCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[inline(always)]
@@ -122,7 +158,7 @@ impl Accumulator {
         let net = network();
         let mut acc = Self {
             values: [net.feature_bias; 2],
-            views: views(board),
+            views: PieceBoards::of(board).views(),
         };
         for perspective in 0..2 {
             acc.refresh(net, board, perspective);
@@ -143,24 +179,58 @@ impl Accumulator {
         });
     }
 
-    /// Moves from `parent` to the position now on `board`, one move later, given the pieces
-    /// removed and added as (color, piece, square). A perspective whose king changed bucket or
-    /// mirroring is rebuilt; the other is updated from the parent, reading it once and writing
-    /// the child once.
+    /// Rebuilds one perspective through the refresh cache: the cached accumulator for this view
+    /// is brought up to date with `boards`, then copied in.
+    fn refresh_cached(&mut self, boards: &PieceBoards, perspective: usize, cache: &mut RefreshCache) {
+        let net = network();
+        let view = self.views[perspective];
+        let entry = &mut cache.entries[perspective][view.cache_slot()];
+        for i in 0..12 {
+            let (color, piece) = (i / 6, i % 6);
+            let (cached, now) = (entry.boards[i], boards.0[i]);
+            let mut gone = cached & !now;
+            while gone != 0 {
+                let square = gone.trailing_zeros() as usize;
+                gone &= gone - 1;
+                let weights = &net.feature_weights[view.feature(perspective, color, piece, square)];
+                for (v, w) in entry.values.iter_mut().zip(weights) {
+                    *v = v.wrapping_sub(*w);
+                }
+            }
+            let mut new = now & !cached;
+            while new != 0 {
+                let square = new.trailing_zeros() as usize;
+                new &= new - 1;
+                let weights = &net.feature_weights[view.feature(perspective, color, piece, square)];
+                for (v, w) in entry.values.iter_mut().zip(weights) {
+                    *v = v.wrapping_add(*w);
+                }
+            }
+            entry.boards[i] = now;
+        }
+        self.values[perspective] = entry.values;
+    }
+
+    /// Moves from `parent` to the position with piece boards `boards`, one move later (or a null
+    /// move, with nothing removed or added), given the pieces removed and added as
+    /// (color, piece, square). A perspective whose king changed bucket or mirroring is rebuilt
+    /// through the refresh cache; the other is updated from the parent, reading it once and
+    /// writing the child once.
     #[inline(always)]
     pub fn update(
         &mut self,
         parent: &Self,
-        board: &Board,
+        boards: &PieceBoards,
         removed: &[(usize, usize, usize)],
         added: &[(usize, usize, usize)],
+        cache: &mut RefreshCache,
     ) {
         let net = network();
-        self.views = views(board);
+        self.views = boards.views();
         for perspective in 0..2 {
             let view = self.views[perspective];
             if view != parent.views[perspective] {
-                self.refresh(net, board, perspective);
+                self.refresh_cached(boards, perspective, cache);
                 continue;
             }
             let row = |&(color, piece, square): &(usize, usize, usize)| {
@@ -324,6 +394,8 @@ pub fn for_each_piece(board: &Board, mut f: impl FnMut(usize, usize, usize)) {
 pub struct PieceBoards([u64; 12]);
 
 impl PieceBoards {
+    pub const EMPTY: Self = Self([0; 12]);
+
     #[inline(always)]
     pub fn of(board: &Board) -> Self {
         let types = [
@@ -340,6 +412,14 @@ impl PieceBoards {
             boards[piece + 6] = types[piece] & board.black;
         }
         Self(boards)
+    }
+
+    /// Both perspectives' views of these pieces.
+    #[inline(always)]
+    pub fn views(&self) -> [View; 2] {
+        let white_king = self.0[5].trailing_zeros() as usize;
+        let black_king = self.0[11].trailing_zeros() as usize;
+        [View::new(0, white_king), View::new(1, black_king)]
     }
 
     /// Fills the removed and added lists going from `self` to `after`; returns their lengths.
@@ -376,11 +456,12 @@ impl PieceBoards {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accumulator, PieceBoards};
+    use super::{Accumulator, PieceBoards, RefreshCache};
     use crate::move_generation::{self, Board};
 
     /// Incremental updates must match a rebuild from scratch after every move, including king
-    /// moves that change bucket or cross the mirror line, castling, en passant and promotion.
+    /// moves that change bucket or cross the mirror line (rebuilt through a refresh cache shared
+    /// by every game), castling, en passant and promotion.
     #[test]
     fn incremental_updates_match_a_full_refresh() {
         move_generation::move_lookup::initialize();
@@ -398,6 +479,7 @@ mod tests {
             "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
         ];
         let mut checked = 0;
+        let mut cache = RefreshCache::new();
         for fen in starts {
             for _ in 0..40 {
                 let mut board = Board::from_fen(fen);
@@ -415,7 +497,7 @@ mod tests {
                     let mut added = [(0, 0, 0); 4];
                     let (r, a) = before.diff(&after, &mut removed, &mut added);
                     let parent = acc;
-                    acc.update(&parent, &board, &removed[..r], &added[..a]);
+                    acc.update(&parent, &after, &removed[..r], &added[..a], &mut cache);
                     let fresh = Accumulator::from_board(&board);
                     assert_eq!(acc.values, fresh.values, "mismatch after {mov} in {board}");
                     assert_eq!(acc.views, fresh.views);

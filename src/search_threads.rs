@@ -174,6 +174,7 @@ impl SearchThreads {
             limits.time_left_ms = limits.black_time_ms;
             limits.increment_ms = limits.black_increment_ms;
         }
+        limits.game_ply = state.root_board.lock().unwrap().game_ply();
         *state.limits.lock().unwrap() = limits;
         state.nodes_searched.store(0, Relaxed);
         state.abort_signal.store(false, Relaxed);

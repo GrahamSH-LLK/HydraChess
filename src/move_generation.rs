@@ -93,6 +93,71 @@ pub fn in_check(board: &Board) -> bool {
             != 0
 }
 
+/// Whether the legal move `mov` checks the opponent, without making it.
+pub fn gives_check(board: &Board, mov: &Move) -> bool {
+    let white = board.white_to_move();
+    let (friendly, enemy) = if white {
+        (board.white, board.black)
+    } else {
+        (board.black, board.white)
+    };
+    let king_mask = enemy & board.kings;
+    let king = king_mask.trailing_zeros() as u8;
+    let (from, to) = (mov.starting_index(), mov.ending_index());
+    let (from_mask, to_mask) = (1u64 << from, 1u64 << to);
+
+    // The board after the move, as far as checks go: what is occupied, and our sliders
+    let mut occupied = (board.all_pieces() & !from_mask) | to_mask;
+    let mut diagonal_sliders = friendly & (board.bishops | board.queens) & !from_mask;
+    let mut straight_sliders = friendly & (board.rooks | board.queens) & !from_mask;
+    let mut piece = board.get_piece_at_square(from).unwrap_or(piece_type::PAWN);
+    match mov.flags() {
+        // En passant also lifts the captured pawn, which can uncover a check
+        0b0001 => occupied &= !(1u64 << if white { to - 8 } else { to + 8 }),
+        // Castling: the rook lands next to the king
+        0b0010 => {
+            let rank = from & !7;
+            let (rook_from, rook_to) = if to % 8 == 6 { (rank + 7, rank + 5) } else { (rank, rank + 3) };
+            occupied = (occupied & !(1u64 << rook_from)) | (1u64 << rook_to);
+            straight_sliders = (straight_sliders & !(1u64 << rook_from)) | (1u64 << rook_to);
+        }
+        0b0100 => piece = piece_type::QUEEN,
+        0b0101 => piece = piece_type::ROOK,
+        0b0110 => piece = piece_type::BISHOP,
+        0b0111 => piece = piece_type::KNIGHT,
+        _ => {}
+    }
+    match piece {
+        piece_type::PAWN => {
+            const FILE_A: u64 = 0x0101_0101_0101_0101;
+            const FILE_H: u64 = FILE_A << 7;
+            let attacks = if white {
+                ((to_mask << 7) & !FILE_H) | ((to_mask << 9) & !FILE_A)
+            } else {
+                ((to_mask >> 9) & !FILE_H) | ((to_mask >> 7) & !FILE_A)
+            };
+            if attacks & king_mask != 0 {
+                return true;
+            }
+        }
+        piece_type::KNIGHT => {
+            if move_lookup::possible_knight_moves(to) & king_mask != 0 {
+                return true;
+            }
+        }
+        piece_type::BISHOP => diagonal_sliders |= to_mask,
+        piece_type::ROOK => straight_sliders |= to_mask,
+        piece_type::QUEEN => {
+            diagonal_sliders |= to_mask;
+            straight_sliders |= to_mask;
+        }
+        _ => {}
+    }
+    // Direct slider checks and discovered checks alike: a slider that sees the king
+    move_lookup::possible_bishop_moves(king, occupied) & diagonal_sliders != 0
+        || move_lookup::possible_rook_moves(king, occupied) & straight_sliders != 0
+}
+
 /// Captures and promotions only, unless in check (then every evasion). Used by quiescence.
 pub fn legal_captures_with_metadata(board: &Board) -> MovesWithMetadata {
     generate_moves::<true>(board)
@@ -620,6 +685,54 @@ mod tests {
         ] {
             walk(&mut Board::from_fen(fen), 3);
         }
+    }
+
+    /// gives_check must agree with making the move and asking whether the opponent is in check,
+    /// for every legal move: direct and discovered checks, castling, en passant and promotion.
+    #[test]
+    fn gives_check_matches_making_the_move() {
+        move_lookup::initialize();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            // Castling that checks, and en passant that uncovers a check along the rank
+            "5k2/8/8/8/8/8/8/R3K2R w KQ - 0 1",
+            "8/8/8/K2pP2r/8/8/8/4k3 w - d6 0 1",
+            "8/8/8/8/k2Pp2R/8/8/4K3 b - d3 0 1",
+        ];
+        let (mut checked, mut checks) = (0, 0);
+        for fen in fens {
+            for _ in 0..60 {
+                let mut board = Board::from_fen(fen);
+                for _ in 0..80 {
+                    let moves = legal_moves(&board);
+                    if moves.length == 0 {
+                        break;
+                    }
+                    for mov in &moves.moves[..moves.length] {
+                        let predicted = gives_check(&board, mov);
+                        let metadata = board.make_move(mov);
+                        let actual = in_check(&board);
+                        board.unmake_move(mov, metadata);
+                        assert_eq!(predicted, actual, "{mov} in {board}");
+                        checked += 1;
+                        checks += actual as usize;
+                    }
+                    board.make_move(&moves.moves[(next() % moves.length as u64) as usize]);
+                }
+            }
+        }
+        assert!(checked > 100_000 && checks > 5_000, "{checked} moves, {checks} checks");
     }
 
     #[test]

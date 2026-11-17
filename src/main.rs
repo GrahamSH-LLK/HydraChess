@@ -94,6 +94,11 @@ fn main() {
                     "option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 65536"
                 )
                 .unwrap();
+                writeln!(
+                    out,
+                    "option name Move Overhead type spin default {DEFAULT_MOVE_OVERHEAD_MS} min 0 max 5000"
+                )
+                .unwrap();
                 writeln!(out, "uciok").unwrap();
                 out.flush().unwrap();
             }
@@ -150,6 +155,8 @@ fn main() {
 }
 
 const BENCH_DEPTH: u8 = 9;
+/// Milliseconds kept back per move for lag between the engine and the server's clock
+const DEFAULT_MOVE_OVERHEAD_MS: u64 = 30;
 
 /// Parses `go` parameters; missing or malformed values are ignored instead of panicking.
 fn parse_go(parts: &[&str]) -> Limits {
@@ -183,16 +190,24 @@ enum EngineCommand {
 fn search_loop(cmd_rx: Receiver<EngineCommand>, stop_signal: Arc<AtomicBool>) {
     let mut threads = DEFAULT_THREADS;
     let mut hash_mb = DEFAULT_HASH_MB;
+    let mut move_overhead_ms = DEFAULT_MOVE_OVERHEAD_MS;
     let mut search = SearchThreads::new(stop_signal.clone(), threads, hash_mb);
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             EngineCommand::NewGame => search.new_game(),
             EngineCommand::Position { position } => search.position(&position),
-            EngineCommand::Go(limits) => search.go(limits),
+            EngineCommand::Go(mut limits) => {
+                limits.move_overhead_ms = move_overhead_ms;
+                search.go(limits);
+            }
             EngineCommand::SetOption { name, value } => {
                 match name.as_str() {
                     "threads" => threads = value,
                     "hash" => hash_mb = value,
+                    "move overhead" => {
+                        move_overhead_ms = value as u64;
+                        continue;
+                    }
                     _ => continue,
                 }
                 // Drop the old threads first so their memory is freed before reallocating
