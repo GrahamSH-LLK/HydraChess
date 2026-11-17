@@ -598,7 +598,10 @@ impl Search {
                 && static_eval >= beta
                 && board.has_non_pawn_material()
             {
-                let reduction = 3 + depth / 4 + ((eval - beta) / 200).min(3);
+                // Leave the null search at least one full ply: straight into quiescence, the
+                // opponent only gets captures, so a quiet mate threat (a mate in one after the
+                // pass) never shows and the pass looks safe
+                let reduction = (3 + depth / 4 + ((eval - beta) / 200).min(3)).min(depth - 2);
                 self.move_stack[ply] = PlyMove::NONE;
                 self.double_extensions[ply + 1] = self.double_extensions[ply];
                 // The null move's child has the same pieces: a copy, once it's needed
