@@ -94,7 +94,18 @@ impl Rng {
 }
 
 
-pub fn datagen(path: &str, target_positions: u64, threads: usize, soft_nodes: u64) {
+/// With `deep_multiplier` > 1, one side (random per game) searches that many times more nodes,
+/// so the shallow side's misjudgements get punished and show up in the game results. Only the
+/// deep side's scores adjudicate. `keep_percent` keeps a random share of the quiet positions, so
+/// a fixed position count spans more games.
+pub fn datagen(
+    path: &str,
+    target_positions: u64,
+    threads: usize,
+    soft_nodes: u64,
+    deep_multiplier: u64,
+    keep_percent: u64,
+) {
     move_generation::move_lookup::initialize();
     let file = OpenOptions::new()
         .create(true)
@@ -132,6 +143,8 @@ pub fn datagen(path: &str, target_positions: u64, threads: usize, soft_nodes: u6
                         &abort_signal,
                         &nodes_searched,
                         soft_nodes,
+                        deep_multiplier,
+                        keep_percent,
                     );
                     let mut out = writer.lock().unwrap();
                     for record in &records {
@@ -168,6 +181,8 @@ fn play_game(
     abort_signal: &AtomicBool,
     nodes_searched: &AtomicU64,
     soft_nodes: u64,
+    deep_multiplier: u64,
+    keep_percent: u64,
 ) -> Vec<PackedPosition> {
     transposition_table.clear();
     search.new_game();
@@ -182,11 +197,20 @@ fn play_game(
         soft_nodes: Some(soft_nodes),
         ..Limits::default()
     };
+    let deep = deep_multiplier > 1;
+    let deep_limits = Limits {
+        nodes: Some(soft_nodes * deep_multiplier * 20),
+        soft_nodes: Some(soft_nodes * deep_multiplier),
+        ..Limits::default()
+    };
+    let deep_is_white = rng.below(2) == 0;
+    // Deep games only adjudicate on every other ply, so the counts halve for the same plies
+    let (win_needed, draw_needed) = if deep { (4, 6) } else { (8, 12) };
 
-    // Random opening: 8 or 9 random plies, then reject lopsided starts
+    // Random opening: 8 to 12 random plies, then reject lopsided starts
     let mut board = 'opening: loop {
         let mut board = Board::starting();
-        let plies = 8 + rng.below(2);
+        let plies = 8 + rng.below(5);
         for _ in 0..plies {
             let moves = move_generation::legal_moves(&board);
             if moves.length == 0 {
@@ -232,7 +256,12 @@ fn play_game(
 
         transposition_table.new_search();
         nodes_searched.store(0, Relaxed);
-        let found = search.search(&mut board, &context, &limits);
+        let deep_turn = deep && board.white_to_move() == deep_is_white;
+        let found = search.search(
+            &mut board,
+            &context,
+            if deep_turn { &deep_limits } else { &limits },
+        );
         let white_score = if board.white_to_move() {
             found.score
         } else {
@@ -251,31 +280,37 @@ fn play_game(
             && !promotion
             && !moves.check
             && found.score.abs() < MATE - 1000
+            && (keep_percent >= 100 || (rng.below(100) as u64) < keep_percent)
         {
             records.push(PackedPosition::pack(&board, white_score.clamp(-32000, 32000) as i16));
         }
 
-        // Adjudication
-        if white_score.abs() >= 2500 {
-            win_plies += 1;
-            if win_plies >= 8 {
-                break if white_score > 0 { 2 } else { 0 };
+        // Adjudication, trusting only the deep side's scores in deep games
+        if !deep || deep_turn {
+            if white_score.abs() >= 2500 {
+                win_plies += 1;
+                if win_plies >= win_needed {
+                    break if white_score > 0 { 2 } else { 0 };
+                }
+            } else {
+                win_plies = 0;
             }
-        } else {
-            win_plies = 0;
-        }
-        if ply >= 80 && white_score.abs() <= 8 {
-            draw_plies += 1;
-            if draw_plies >= 12 {
-                break 1;
+            if ply >= 80 && white_score.abs() <= 8 {
+                draw_plies += 1;
+                if draw_plies >= draw_needed {
+                    break 1;
+                }
+            } else {
+                draw_plies = 0;
             }
-        } else {
-            draw_plies = 0;
         }
 
         board.make_move(&mov);
         ply += 1;
     };
+    if deep && std::env::var_os("DATAGEN_DEBUG").is_some() {
+        eprintln!("game deep={} result={result} plies={ply}", if deep_is_white { "white" } else { "black" });
+    }
     for record in &mut records {
         record.result = result;
     }

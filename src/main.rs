@@ -38,16 +38,22 @@ fn main() {
         return;
     }
 
-    // `HydraChess datagen <out> [positions] [threads] [soft nodes]` writes self-play training data
+    // `HydraChess datagen <out> [positions] [threads] [soft nodes] [deep multiplier] [keep %]`
+    // writes self-play training data
     if args.get(1).map(String::as_str) == Some("datagen") {
         let Some(path) = args.get(2) else {
-            eprintln!("usage: HydraChess datagen <out file> [positions] [threads] [soft nodes]");
+            eprintln!(
+                "usage: HydraChess datagen <out file> [positions] [threads] [soft nodes] \
+                 [deep multiplier] [keep %]"
+            );
             process::exit(2);
         };
         let positions = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(1_000_000);
         let threads = args.get(4).and_then(|t| t.parse().ok()).unwrap_or(1);
         let soft_nodes = args.get(5).and_then(|n| n.parse().ok()).unwrap_or(5000);
-        search_threads::datagen(path, positions, threads, soft_nodes);
+        let deep_multiplier = args.get(6).and_then(|n| n.parse().ok()).unwrap_or(1).max(1);
+        let keep_percent = args.get(7).and_then(|n| n.parse().ok()).unwrap_or(100).clamp(1, 100);
+        search_threads::datagen(path, positions, threads, soft_nodes, deep_multiplier, keep_percent);
         return;
     }
 
