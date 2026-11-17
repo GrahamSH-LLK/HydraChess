@@ -1,5 +1,7 @@
 use crate::move_generation::mov::Move;
+use crate::search_threads::is_mate_score;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::search_threads::searcher::Search;
 
 #[derive(Debug)]
 struct Entry {
@@ -7,10 +9,26 @@ struct Entry {
     data: AtomicU64,
 }
 
+fn score_to_tt(score: i32, search_plies: u8) -> i32 {
+    if is_mate_score(score) {
+        score + (search_plies as i32) * score.signum()
+    } else {
+        score
+    }
+}
+
+fn tt_to_score(score: i32, search_plies: u8) -> i32 {
+    if is_mate_score(score) {
+        score - (search_plies as i32) * score.signum()
+    } else {
+        score
+    }
+}
+
 impl Entry {
-    fn data_from_entry_result(entry_result: EntryResult) -> u64 {
+    fn data_from_entry_result(entry_result: EntryResult, search_plies: u8) -> u64 {
         entry_result.best_move.data as u64
-            | (((entry_result.score as u64) & 0xFFFFFFFF) << 16)
+            | (((score_to_tt(entry_result.score, search_plies) as u64) & 0xFFFFFFFF) << 16)
             | (entry_result.depth as u64) << (16 + 32)
             | (entry_result.node_type as u64) << (16 + 32 + 8)
     }
@@ -34,10 +52,10 @@ impl EntryResult {
         }
     }
 
-    fn from_u64(data: u64) -> Self {
+    fn from_u64(data: u64, search_plies: u8) -> Self {
         Self {
             best_move: Move { data: data as u16 },
-            score: (data >> 16) as i32,
+            score: tt_to_score((data >> 16) as i32, search_plies),
             depth: (data >> 48) as u8,
             node_type: (data >> 56) as i8,
         }
@@ -62,29 +80,29 @@ impl TranspositionTable {
         Self { size, table }
     }
 
-    pub fn get(&self, zobrist_key: u64) -> Option<EntryResult> {
+    pub fn get(&self, zobrist_key: u64, search_plies: u8) -> Option<EntryResult> {
         let index = zobrist_key as usize % self.size;
         let entry = &self.table[index];
         let key_xor_data = entry.zobrist_key_xor_data.load(Ordering::Acquire);
         let data = entry.data.load(Ordering::Acquire);
         if key_xor_data == zobrist_key ^ data {
-            Some(EntryResult::from_u64(data))
+            Some(EntryResult::from_u64(data, search_plies))
         } else {
             None
         }
     }
 
-    pub fn insert(&self, zobrist_key: u64, entry_result: EntryResult) {
+    pub fn insert(&self, zobrist_key: u64, entry_result: EntryResult, search_plies: u8) {
         let index = zobrist_key as usize % self.size;
         let entry = &self.table[index];
-        let data = Entry::data_from_entry_result(entry_result);
+        let data = Entry::data_from_entry_result(entry_result, search_plies);
 
         // Keep a strictly deeper entry for the same position. An equal-depth entry is replaced so
         // that a PVS re-search can overwrite the null-window bound it just produced with the
         // exact score (and so fresher bounds win over stale ones).
         let current_data = entry.data.load(Ordering::Relaxed);
         if entry.zobrist_key_xor_data.load(Ordering::Relaxed) == zobrist_key ^ current_data
-            && EntryResult::from_u64(current_data).depth > entry_result.depth
+            && EntryResult::from_u64(current_data, search_plies).depth > entry_result.depth
         {
             return;
         }
@@ -106,6 +124,7 @@ impl TranspositionTable {
 #[cfg(test)]
 mod tests {
     use crate::move_generation::mov::Move;
+    use crate::search_threads::searcher::Search;
     use crate::search_threads::transposition_table::{EntryResult, TranspositionTable};
 
     #[test]
@@ -117,8 +136,8 @@ mod tests {
             node_type: 0,
         };
         let table = TranspositionTable::new(1);
-        table.insert(0, entry_result);
-        assert_eq!(table.get(0), Some(entry_result));
+        table.insert(0, entry_result, 0);
+        assert_eq!(table.get(0, 0), Some(entry_result));
     }
 
     #[test]
@@ -127,10 +146,10 @@ mod tests {
         let deep = EntryResult::new(8, 100, 0, Move::left_en_passant(10));
         let shallow = EntryResult::new(4, -100, 1, Move::null());
 
-        table.insert(0, deep);
-        table.insert(0, shallow);
+        table.insert(0, deep, 0);
+        table.insert(0, shallow, 0);
 
-        assert_eq!(table.get(0), Some(deep));
+        assert_eq!(table.get(0, 0), Some(deep));
     }
 
     #[test]
@@ -139,9 +158,9 @@ mod tests {
         let bound = EntryResult::new(6, 50, 1, Move::null());
         let exact = EntryResult::new(6, 42, 0, Move::left_en_passant(10));
 
-        table.insert(0, bound);
-        table.insert(0, exact);
+        table.insert(0, bound, 0);
+        table.insert(0, exact, 0);
 
-        assert_eq!(table.get(0), Some(exact));
+        assert_eq!(table.get(0, 0), Some(exact));
     }
 }

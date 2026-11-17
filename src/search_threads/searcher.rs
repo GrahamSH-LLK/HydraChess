@@ -67,7 +67,7 @@ impl Search {
         }
 
         let color = if board.white_to_move() { 1 } else { -1 };
-        let transposition_table_result = search_state.transposition_table.get(board.zobrist_hash);
+        let transposition_table_result = search_state.transposition_table.get(board.zobrist_hash, 0);
         let mut tt_move = None;
         if let Some(result) = transposition_table_result {
             tt_move = Some(result.best_move);
@@ -93,93 +93,113 @@ impl Search {
                 }
             }
 
-            let mut depth_best_score = -i32::MAX;
-            let mut depth_best_move = best_move;
-            let mut depth_best_ply = 0;
-            for i in 0..sorted_moves.len() {
-                let (mov, sort_eval) = &mut sorted_moves[i];
-                let metadata = board.make_move(mov);
+            let mut delta = 50;
+            let (mut alpha, mut beta) = if depth <= 4 {
+                (-i32::MAX, i32::MAX)
+            } else {
+                (
+                    best_score.saturating_sub(delta).max(-i32::MAX),
+                    best_score.saturating_add(delta),
+                )
+            };
 
-                let result = if i == 0 || depth < 2 {
-                    self.negamax(
-                        board,
-                        search_state,
-                        depth,
-                        0,
-                        -i32::MAX,
-                        -depth_best_score,
-                        -color,
-                    )
-                } else {
-                    // Moves that aren't the first one probably aren't as good, so do a null window search
-                    // to confirm that they're not better than the best move
-                    let pvs = self.negamax(
-                        board,
-                        search_state,
-                        depth,
-                        0,
-                        -depth_best_score - 1,
-                        -depth_best_score,
-                        -color,
-                    );
-                    if let Some(pvs) = pvs {
-                        // If the move's not worth looking at, just return that search result
-                        let value = -pvs.0;
-                        if value <= depth_best_score {
-                            Some(pvs)
-                        } else {
-                            // If it turns out it is actually better, we need a full search to quantify how much better
-                            self.negamax(
-                                board,
-                                search_state,
-                                depth,
-                                0,
-                                -i32::MAX,
-                                -depth_best_score,
-                                -color,
-                            )
-                        }
+            let mut alpha_start = alpha;
+            'aspiration: loop {
+                let mut depth_best_score = -i32::MAX;
+                let mut depth_best_move = best_move;
+                let mut depth_best_ply = 0;
+                for i in 0..sorted_moves.len() {
+                    let (mov, sort_eval) = &mut sorted_moves[i];
+                    let metadata = board.make_move(mov);
+
+                    let result = if i == 0 || depth < 2 {
+                        self.negamax(board, search_state, depth, 0, -beta, -alpha, -color)
                     } else {
-                        None
-                    }
-                };
+                        // Moves that aren't the first one probably aren't as good, so do a null window search
+                        // to confirm that they're not better than the best move
+                        let mut res =
+                            self.negamax(board, search_state, depth, 0, -alpha - 1, -alpha, -color);
+                        if let Some((score, _)) = res
+                            && -score > alpha
+                            && -score < beta
+                        {
+                            res =
+                                self.negamax(board, search_state, depth, 0, -beta, -alpha, -color);
+                        }
+                        res
+                    };
 
-                if result.is_none() {
+                    if result.is_none() {
+                        board.unmake_move(mov, metadata);
+                        break 'iterative_deepening;
+                    }
+
+                    let (eval, searched_ply) = result.unwrap();
+                    let eval = -eval;
+
+                    *sort_eval = eval;
+
                     board.unmake_move(mov, metadata);
-                    break 'iterative_deepening;
-                }
 
-                let (eval, searched_ply) = result.unwrap();
-                let eval = -eval;
+                    if eval > depth_best_score {
+                        depth_best_score = eval;
+                        depth_best_move = *mov;
+                        depth_best_ply = searched_ply;
+                    }
+                    if eval > alpha {
+                        alpha = eval;
+                    }
+                    if alpha >= beta {
+                        // Fail high: we need to redo the search with a larger window, and to look at this new move
+                        // first
+                        sorted_moves.swap(0, i);
+                        break;
+                    }
 
-                *sort_eval = eval;
+                    if search_id == 0 {
+                        let score = if depth > 0 { best_score } else { 0 };
+                        let time = timer.elapsed().as_secs_f64();
+                        let nodes = search_state.nodes_searched.load(Ordering::Relaxed)
+                            + (self.nodes_searched & 2047);
+                        if timer.elapsed().as_secs_f64() - last_print_time > 0.05 {
+                            print_info(depth, depth_best_ply, score, time, nodes);
+                            last_print_time = timer.elapsed().as_secs_f64();
+                        }
+                    }
 
-                board.unmake_move(mov, metadata);
-                if eval > depth_best_score {
-                    depth_best_score = eval;
-                    depth_best_move = *mov;
-                    depth_best_ply = searched_ply;
-                }
-
-                if search_id == 0 {
-                    let score = if depth > 0 { best_score } else { 0 };
-                    let time = timer.elapsed().as_secs_f64();
-                    let nodes = search_state.nodes_searched.load(Ordering::Relaxed)
-                        + (self.nodes_searched & 2047);
-                    if timer.elapsed().as_secs_f64() - last_print_time > 0.05 {
-                        print_info(depth, depth_best_ply, score, time, nodes);
-                        last_print_time = timer.elapsed().as_secs_f64();
+                    if !Self::time_ok(search_state) {
+                        break 'iterative_deepening;
                     }
                 }
 
-                if !Self::time_ok(search_state) {
-                    break 'iterative_deepening;
+                // Check if the root search failed outside our aspiration window
+                if depth_best_score <= alpha_start {
+                    // (save original alpha before loop!)
+                    // Fail-low: widen alpha downward and re-search
+                    alpha = depth_best_score.saturating_sub(delta).max(-i32::MAX);
+                    alpha_start = alpha;
+                    delta *= 2;
+                    if delta > 500 {
+                        alpha = -i32::MAX;
+                        alpha_start = -i32::MAX;
+                    }
+                } else if depth_best_score >= beta {
+                    // Fail-high: widen beta upward and re-search
+                    beta = depth_best_score.saturating_add(delta);
+                    alpha = alpha_start; // Reset alpha to start of window
+                    delta *= 2;
+                    if delta > 500 {
+                        beta = i32::MAX;
+                    }
+                } else {
+                    // Exact score found
+                    best_score = depth_best_score;
+                    best_move = depth_best_move;
+                    best_depth = depth;
+                    best_ply = depth_best_ply;
+                    break 'aspiration;
                 }
             }
-            best_score = depth_best_score;
-            best_move = depth_best_move;
-            best_depth = depth;
-            best_ply = depth_best_ply;
             // We've reached the maximum depth, any further search is meaningless so exit early
             if depth + 1 == MAX_DEPTH {
                 search_state.stop_signal.store(true, Ordering::Relaxed);
@@ -210,13 +230,11 @@ impl Search {
         alpha: i32,
         beta: i32,
         color: i32,
-    ) -> Option<(i32, u8)>
-    {
+    ) -> Option<(i32, u8)> {
         if board.get_halfmove_clock() > 100 || board.times_played() >= 3 {
             return Some((0, search_ply));
         }
         self.count_nodes(search_state.nodes_searched);
-        let mut evaluation_type = 1;
 
         // Alpha can't possibly be worse than getting checkmated right now, if it is it means we already found a
         // faster mate elsewhere
@@ -227,6 +245,8 @@ impl Search {
             return Some((alpha, search_ply));
         }
 
+        let alpha_original = alpha;
+
         let moves = move_generation::legal_moves_with_metadata(board);
         if moves.length == 0 {
             return if moves.check {
@@ -236,15 +256,20 @@ impl Search {
             };
         }
 
-        let tt_result = search_state.transposition_table.get(board.zobrist_hash);
+        let tt_result = search_state.transposition_table.get(board.zobrist_hash, search_ply);
         let mut tt_move = None;
         if let Some(tt_result) = tt_result {
             tt_move = Some(tt_result.best_move);
+            let non_pv = search_ply > 0 && beta - alpha == 1;
             if tt_result.depth >= depth {
                 match tt_result.node_type {
-                    1 => beta = beta.min(tt_result.score),           // Upper bound
+                    1 if non_pv && tt_result.score <= alpha => {
+                        return Some((tt_result.score, search_ply));
+                    } // Upper bound
                     0 => return Some((tt_result.score, search_ply)), // Exact
-                    -1 => alpha = alpha.max(tt_result.score),        // Lower bound
+                    -1 if non_pv && tt_result.score >= beta => {
+                        return Some((tt_result.score, search_ply));
+                    } // Lower bound
                     _ => {}
                 }
                 if alpha >= beta {
@@ -369,19 +394,24 @@ impl Search {
                 // Only trust moves that actually raised alpha. In fail-low nodes every child score
                 // is just an upper bound, so storing those in TT poisons the move ordering.
                 best_move = mov;
-                evaluation_type = 0;
                 if alpha >= beta {
-                    evaluation_type = -1;
                     self.killer_moves[search_ply as usize] = Some(mov);
                     break;
                 }
             }
         }
 
-        let tt_score = if evaluation_type == -1 { beta } else { alpha };
+        let evaluation_type = if best_value <= alpha_original {
+            1
+        } else if best_value >= beta {
+            -1
+        } else {
+            0
+        };
         search_state.transposition_table.insert(
             board.zobrist_hash,
-            EntryResult::new(depth, tt_score, evaluation_type, best_move),
+            EntryResult::new(depth, best_value, evaluation_type, best_move),
+            search_ply
         );
         Some((best_value, best_searched_ply))
     }
@@ -396,8 +426,7 @@ impl Search {
         beta: i32,
         search_ply: u8,
         color: i32,
-    ) -> Option<(i32, u8)>
-    {
+    ) -> Option<(i32, u8)> {
         if !Self::time_ok(search_state) {
             return None;
         }
